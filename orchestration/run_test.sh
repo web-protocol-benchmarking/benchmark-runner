@@ -1,0 +1,174 @@
+#!/usr/bin/env bash
+#
+# run_test.sh — Network-namespace benchmark harness.
+#
+# Creates ns_server and ns_client, connects them with a direct veth pair on a
+# /30 subnet (no bridge, no loopback shortcut), applies symmetric tc netem on
+# both veth egress qdiscs, launches the server in ns_server and the client in
+# ns_client, and tears everything down on exit.
+#
+# Must be run as root (ip netns / tc require CAP_NET_ADMIN).
+
+set -euo pipefail
+
+# --- Topology constants -------------------------------------------------------
+NS_SERVER="ns_server"
+NS_CLIENT="ns_client"
+VETH_SERVER="veth_s"
+VETH_CLIENT="veth_c"
+SERVER_IP="10.0.0.1"
+CLIENT_IP="10.0.0.2"
+SUBNET_PREFIX="30"
+SERVER_PORT="${SERVER_PORT:-8080}"
+
+# --- Defaults -----------------------------------------------------------------
+DURATION=30
+LOSS="0%"
+DELAY="0ms"
+SERVER_CMD=""
+CLIENT_CMD=""
+PIDSTAT_INTERVAL=1
+RESULTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/results"
+
+usage() {
+    cat >&2 <<EOF
+Usage: $0 --server "<cmd>" --client "<cmd>" [options]
+
+Required:
+  --server CMD       Command to launch the echo server (runs in ns_server).
+  --client CMD       Command to launch the load generator (runs in ns_client).
+
+Options:
+  --duration SECS    Test duration in seconds (default: ${DURATION}).
+  --loss PCT         tc netem packet loss, e.g. "1%" (default: ${LOSS}).
+  --delay MS         tc netem one-way delay, e.g. "20ms" (default: ${DELAY}).
+  --port PORT        Server port (default: ${SERVER_PORT}).
+  -h, --help         Show this message.
+
+Environment exported to children:
+  SERVER_IP, CLIENT_IP, SERVER_PORT
+EOF
+    exit "${1:-0}"
+}
+
+# --- Arg parsing --------------------------------------------------------------
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --server)    SERVER_CMD="$2"; shift 2 ;;
+        --client)    CLIENT_CMD="$2"; shift 2 ;;
+        --duration)  DURATION="$2"; shift 2 ;;
+        --loss)      LOSS="$2"; shift 2 ;;
+        --delay)     DELAY="$2"; shift 2 ;;
+        --port)      SERVER_PORT="$2"; shift 2 ;;
+        -h|--help)   usage 0 ;;
+        *)           echo "Unknown argument: $1" >&2; usage 1 ;;
+    esac
+done
+
+[[ -z "$SERVER_CMD" || -z "$CLIENT_CMD" ]] && usage 1
+[[ $EUID -eq 0 ]] || { echo "Must be run as root." >&2; exit 1; }
+
+mkdir -p "$RESULTS_DIR"
+RUN_TAG="$(date +%Y%m%d_%H%M%S)_loss${LOSS//%/p}_delay${DELAY}"
+RUN_DIR="$RESULTS_DIR/$RUN_TAG"
+mkdir -p "$RUN_DIR"
+
+SERVER_PID=""
+CLIENT_PID=""
+PIDSTAT_PID=""
+
+cleanup() {
+    local ec=$?
+    set +e
+    echo "[cleanup] tearing down..." >&2
+
+    [[ -n "$CLIENT_PID"  ]] && kill -TERM "$CLIENT_PID"  2>/dev/null
+    [[ -n "$SERVER_PID"  ]] && kill -TERM "$SERVER_PID"  2>/dev/null
+    [[ -n "$PIDSTAT_PID" ]] && kill -TERM "$PIDSTAT_PID" 2>/dev/null
+    wait 2>/dev/null
+
+    ip netns del "$NS_SERVER" 2>/dev/null
+    ip netns del "$NS_CLIENT" 2>/dev/null
+    # Deleting the netns destroys veth endpoints inside it; the peer goes too.
+    ip link del "$VETH_SERVER" 2>/dev/null
+    ip link del "$VETH_CLIENT" 2>/dev/null
+
+    exit "$ec"
+}
+trap cleanup EXIT INT TERM
+
+# --- Topology setup -----------------------------------------------------------
+echo "[setup] creating namespaces and veth pair..." >&2
+
+# Defensive pre-cleanup in case a previous run died mid-flight.
+ip netns del "$NS_SERVER" 2>/dev/null || true
+ip netns del "$NS_CLIENT" 2>/dev/null || true
+ip link  del "$VETH_SERVER" 2>/dev/null || true
+ip link  del "$VETH_CLIENT" 2>/dev/null || true
+
+ip netns add "$NS_SERVER"
+ip netns add "$NS_CLIENT"
+
+ip link add "$VETH_SERVER" type veth peer name "$VETH_CLIENT"
+ip link set "$VETH_SERVER" netns "$NS_SERVER"
+ip link set "$VETH_CLIENT" netns "$NS_CLIENT"
+
+ip -n "$NS_SERVER" addr add "${SERVER_IP}/${SUBNET_PREFIX}" dev "$VETH_SERVER"
+ip -n "$NS_CLIENT" addr add "${CLIENT_IP}/${SUBNET_PREFIX}" dev "$VETH_CLIENT"
+
+ip -n "$NS_SERVER" link set "$VETH_SERVER" up
+ip -n "$NS_CLIENT" link set "$VETH_CLIENT" up
+ip -n "$NS_SERVER" link set lo up
+ip -n "$NS_CLIENT" link set lo up
+
+# --- tc netem (symmetric egress on both endpoints) ----------------------------
+echo "[setup] applying netem: loss=${LOSS} delay=${DELAY} (both directions)" >&2
+ip netns exec "$NS_SERVER" tc qdisc add dev "$VETH_SERVER" root netem \
+    delay "$DELAY" loss "$LOSS"
+ip netns exec "$NS_CLIENT" tc qdisc add dev "$VETH_CLIENT" root netem \
+    delay "$DELAY" loss "$LOSS"
+
+# --- Connectivity smoke test --------------------------------------------------
+if ! ip netns exec "$NS_CLIENT" ping -c1 -W2 "$SERVER_IP" >/dev/null; then
+    echo "[setup] sanity ping failed; aborting." >&2
+    exit 1
+fi
+
+# --- Launch server ------------------------------------------------------------
+export SERVER_IP CLIENT_IP SERVER_PORT
+SERVER_LOG="$RUN_DIR/server.log"
+CLIENT_LOG="$RUN_DIR/client.log"
+PIDSTAT_LOG="$RUN_DIR/pidstat.log"
+
+echo "[run] launching server in $NS_SERVER -> $SERVER_LOG" >&2
+ip netns exec "$NS_SERVER" env \
+    SERVER_IP="$SERVER_IP" SERVER_PORT="$SERVER_PORT" \
+    bash -c "$SERVER_CMD" >"$SERVER_LOG" 2>&1 &
+SERVER_PID=$!
+
+# Give the server a moment to bind.
+sleep 1
+if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+    echo "[run] server failed to start; see $SERVER_LOG" >&2
+    exit 1
+fi
+
+# --- pidstat (host-side, by PID; sees the in-namespace process normally) ------
+echo "[run] starting pidstat (interval=${PIDSTAT_INTERVAL}s) -> $PIDSTAT_LOG" >&2
+pidstat -h -r -u -p "$SERVER_PID" "$PIDSTAT_INTERVAL" >"$PIDSTAT_LOG" 2>&1 &
+PIDSTAT_PID=$!
+
+# --- Launch client ------------------------------------------------------------
+echo "[run] launching client in $NS_CLIENT for ${DURATION}s -> $CLIENT_LOG" >&2
+ip netns exec "$NS_CLIENT" env \
+    SERVER_IP="$SERVER_IP" CLIENT_IP="$CLIENT_IP" SERVER_PORT="$SERVER_PORT" \
+    DURATION="$DURATION" RESULTS_DIR="$RUN_DIR" \
+    bash -c "$CLIENT_CMD" >"$CLIENT_LOG" 2>&1 &
+CLIENT_PID=$!
+
+# Wait for the client to finish (it owns the test duration).
+wait "$CLIENT_PID"
+CLIENT_RC=$?
+
+echo "[run] client exited rc=$CLIENT_RC; results in $RUN_DIR" >&2
+exit "$CLIENT_RC"

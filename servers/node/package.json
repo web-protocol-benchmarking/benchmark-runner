@@ -1,0 +1,23 @@
+{
+  "name": "@benchmark-runner/node-servers",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Node.js echo servers (WebSocket, SSE, long polling) for the benchmark-runner thesis suite.",
+  "scripts": {
+    "start:ws": "node websocket.js",
+    "start:sse": "node sse.js",
+    "start:short-polling": "node short-polling.js",
+    "start:long-polling": "node long-polling.js",
+    "format": "prettier --write ."
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "prettier": "^3.3.3"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
