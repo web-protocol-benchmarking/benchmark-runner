@@ -8,16 +8,9 @@
     "start:ws": "node websocket.js",
     "start:sse": "node sse.js",
     "start:short-polling": "node short-polling.js",
-    "start:long-polling": "node long-polling.js",
-    "format": "prettier --write ."
+    "start:long-polling": "node long-polling.js"
   },
   "dependencies": {
     "ws": "^8.18.0"
-  },
-  "devDependencies": {
-    "prettier": "^3.3.3"
-  },
-  "engines": {
-    "node": ">=20"
   }
 }

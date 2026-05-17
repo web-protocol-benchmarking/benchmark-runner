@@ -61,7 +61,7 @@ Deno.serve({ hostname: host, port }, async (req) => {
         if (body === null) {
             return new Response('hanging GET superseded or cancelled', { status: 409 });
         }
-        return new Response(body, {
+        return new Response(body.buffer as ArrayBuffer, {
             status: 200,
             headers: {
                 'Content-Type': 'application/json',
