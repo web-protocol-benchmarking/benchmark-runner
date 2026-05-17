@@ -22,8 +22,17 @@ RESULTS_DIR="$REPO_ROOT/results"
 METRICS_CSV="$RESULTS_DIR/metrics.csv"
 
 # --- Matrix parameters --------------------------------------------------------
+# The matrix is asymmetric — not every runtime has the same WebTransport variants.
+# Deno webtransport-fails-components is excluded: the package uses internal Node.js
+# socket APIs (getSendQueueCount) that Deno's compat layer does not implement.
+#   node:  ws sse short-polling long-polling webtransport-fails-components          (5)
+#   bun:   ws sse short-polling long-polling webtransport-vmeansdev wt-fc           (6)
+#   deno:  ws sse short-polling long-polling webtransport                           (5)
+# Total: 16 combinations.
 RUNTIMES=(node deno bun)
-PROTOCOLS=(ws sse short-polling long-polling)
+PROTOCOLS_NODE=(ws sse short-polling long-polling webtransport-fails-components)
+PROTOCOLS_BUN=(ws sse short-polling long-polling webtransport-vmeansdev webtransport-fails-components)
+PROTOCOLS_DENO=(ws sse short-polling long-polling webtransport)
 DURATION=2
 CLIENTS=2
 MIN_RTT_SAMPLES=10
@@ -55,28 +64,43 @@ for bin in node deno bun pidstat; do
 done
 
 # Each (runtime, protocol) needs the corresponding server source file present.
-# Server files are named for the wire protocol: short-polling.{js,ts} and
-# long-polling.{js,ts} live alongside websocket.{js,ts} and sse.{js,ts}.
-for runtime in "${RUNTIMES[@]}"; do
-    for proto in "${PROTOCOLS[@]}"; do
-        case "$runtime" in
-            node) ext="js" ;;
-            *)    ext="ts" ;;
-        esac
-        case "$proto" in
-            ws)             base="websocket" ;;
-            sse)            base="sse" ;;
-            short-polling)  base="short-polling" ;;
-            long-polling)   base="long-polling" ;;
-        esac
+proto_to_base() {
+    case "$1" in
+        ws)                            echo "websocket" ;;
+        sse)                           echo "sse" ;;
+        short-polling)                 echo "short-polling" ;;
+        long-polling)                  echo "long-polling" ;;
+        webtransport)                  echo "webtransport" ;;
+        webtransport-fails-components) echo "webtransport-fails-components" ;;
+        webtransport-vmeansdev)        echo "webtransport-vmeansdev" ;;
+    esac
+}
+check_sources() {
+    local runtime="$1" ext="$2"
+    shift 2
+    for proto in "$@"; do
+        local base path
+        base=$(proto_to_base "$proto")
         path="$REPO_ROOT/servers/$runtime/$base.$ext"
         [[ -f "$path" ]] || fail "server source missing: $path"
     done
-done
+}
+check_sources node js "${PROTOCOLS_NODE[@]}"
+check_sources bun  ts "${PROTOCOLS_BUN[@]}"
+check_sources deno ts "${PROTOCOLS_DENO[@]}"
 
-# Node needs ws installed; Deno and Bun have no external deps.
+# Check required npm packages are installed.
 if [[ ! -d "$REPO_ROOT/servers/node/node_modules/ws" ]]; then
-    fail "ws package not installed. Run: (cd $REPO_ROOT/servers/node && npm install)"
+    fail "ws not installed. Run: (cd $REPO_ROOT/servers/node && npm install)"
+fi
+if [[ ! -d "$REPO_ROOT/servers/node/node_modules/@fails-components/webtransport" ]]; then
+    fail "@fails-components/webtransport not installed in node. Run: (cd $REPO_ROOT/servers/node && npm install)"
+fi
+if [[ ! -d "$REPO_ROOT/servers/bun/node_modules/@webtransport-bun" ]]; then
+    fail "@webtransport-bun/webtransport not installed. Run: (cd $REPO_ROOT/servers/bun && bun install)"
+fi
+if [[ ! -d "$REPO_ROOT/servers/bun/node_modules/@fails-components/webtransport" ]]; then
+    fail "@fails-components/webtransport not installed in bun. Run: (cd $REPO_ROOT/servers/bun && bun add @fails-components/webtransport @fails-components/webtransport-transport-http3-quiche && bun pm trust @fails-components/webtransport-transport-http3-quiche)"
 fi
 
 ok "pre-flight checks passed (node, deno, bun, pidstat, all server sources)"
@@ -85,16 +109,20 @@ ok "pre-flight checks passed (node, deno, bun, pidstat, all server sources)"
 server_cmd_for() {
     local runtime="$1" proto="$2"
     local base
-    case "$proto" in
-        ws)             base="websocket" ;;
-        sse)            base="sse" ;;
-        short-polling)  base="short-polling" ;;
-        long-polling)   base="long-polling" ;;
-    esac
+    local base
+    base=$(proto_to_base "$proto")
     case "$runtime" in
         node) echo "node $REPO_ROOT/servers/node/$base.js" ;;
-        deno) echo "deno run --allow-net --allow-env --allow-read $REPO_ROOT/servers/deno/$base.ts" ;;
-        bun)  echo "bun $REPO_ROOT/servers/bun/$base.ts" ;;
+        deno)
+            if [[ "$proto" == "webtransport" ]]; then
+                echo "deno run --allow-net --allow-env --allow-read --unstable-net $REPO_ROOT/servers/deno/$base.ts"
+            elif [[ "$proto" == "webtransport-fails-components" ]]; then
+                echo "deno run --allow-net --allow-env --allow-read --allow-ffi $REPO_ROOT/servers/deno/$base.ts"
+            else
+                echo "deno run --allow-net --allow-env --allow-read $REPO_ROOT/servers/deno/$base.ts"
+            fi
+            ;;
+        bun) echo "bun $REPO_ROOT/servers/bun/$base.ts" ;;
     esac
 }
 
@@ -114,10 +142,16 @@ run_one() {
     local server_cmd
     server_cmd=$(server_cmd_for "$runtime" "$proto")
 
-    local client_cmd="deno run --allow-net --allow-read --allow-write --allow-env \
+    # All webtransport variants use --protocol webtransport on the client
+    # (same WebTransport API; server backend differs). --unstable-net is
+    # required on the client whenever it uses new WebTransport(...).
+    local client_proto="$proto"
+    local wt_flag=""
+    [[ "$proto" == webtransport* ]] && client_proto="webtransport" && wt_flag="--unstable-net"
+    local client_cmd="deno run --allow-net --allow-read --allow-write --allow-env $wt_flag \
         $CLIENT_SCRIPT \
         --target \$SERVER_IP:\$SERVER_PORT \
-        --protocol $proto \
+        --protocol $client_proto \
         --duration \$DURATION \
         --clients $CLIENTS"
 
@@ -157,11 +191,14 @@ run_one() {
             || fail "${tag}: expected exactly 1 new row in metrics.csv, got $new_rows"
     fi
 
-    local last_row protocol_col
+    local last_row protocol_col expected_proto
     last_row=$(tail -n1 "$METRICS_CSV")
     protocol_col=$(echo "$last_row" | cut -d',' -f2)
-    [[ "$protocol_col" == "$proto" ]] \
-        || fail "${tag}: metrics.csv row protocol=$protocol_col, expected $proto"
+    # Variant names (webtransport-*) all write "webtransport" to metrics.csv.
+    expected_proto="$proto"
+    [[ "$proto" == webtransport* ]] && expected_proto="webtransport"
+    [[ "$protocol_col" == "$expected_proto" ]] \
+        || fail "${tag}: metrics.csv row protocol=$protocol_col, expected $expected_proto"
 
     # ---- Assertion: rtts.csv exists with header + > MIN samples -------------
     local raw_rtts raw_header raw_samples
@@ -194,13 +231,18 @@ run_one() {
 }
 
 # --- Drive the full matrix ----------------------------------------------------
-yellow "[smoke] matrix: ${#RUNTIMES[@]} runtimes x ${#PROTOCOLS[@]} protocols = $((${#RUNTIMES[@]} * ${#PROTOCOLS[@]})) runs"
+yellow "[smoke] matrix: 16 combinations (node×5, bun×6, deno×5)"
 yellow "[smoke] per-run: ${DURATION}s, ${CLIENTS} clients, loss=0%, delay=0ms"
 echo ""
 
 port_offset=0
 for runtime in "${RUNTIMES[@]}"; do
-    for proto in "${PROTOCOLS[@]}"; do
+    case "$runtime" in
+        node) protos=("${PROTOCOLS_NODE[@]}") ;;
+        bun)  protos=("${PROTOCOLS_BUN[@]}") ;;
+        deno) protos=("${PROTOCOLS_DENO[@]}") ;;
+    esac
+    for proto in "${protos[@]}"; do
         port=$(( BASE_PORT + port_offset ))
         run_one "$runtime" "$proto" "$port"
         port_offset=$(( port_offset + 1 ))
@@ -209,6 +251,6 @@ for runtime in "${RUNTIMES[@]}"; do
 done
 
 green "===================="
-green "MATRIX PASSED ($((${#RUNTIMES[@]} * ${#PROTOCOLS[@]}))/$((${#RUNTIMES[@]} * ${#PROTOCOLS[@]})) combinations)"
+green "MATRIX PASSED (all combinations)"
 green "===================="
 echo "metrics: $METRICS_CSV"

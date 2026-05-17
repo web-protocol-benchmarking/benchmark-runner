@@ -22,7 +22,7 @@
 // CLI parsing
 // ============================================================================
 
-type Protocol = 'ws' | 'sse' | 'short-polling' | 'long-polling';
+type Protocol = 'ws' | 'sse' | 'short-polling' | 'long-polling' | 'webtransport';
 
 interface Args {
     target: string;       // "host:port"
@@ -57,9 +57,10 @@ function parseArgs(argv: string[]): Args {
         protocol !== 'ws' &&
         protocol !== 'sse' &&
         protocol !== 'short-polling' &&
-        protocol !== 'long-polling'
+        protocol !== 'long-polling' &&
+        protocol !== 'webtransport'
     ) {
-        throw new Error(`--protocol must be one of: ws, sse, short-polling, long-polling`);
+        throw new Error(`--protocol must be one of: ws, sse, short-polling, long-polling, webtransport`);
     }
 
     const duration = Number(get('duration'));
@@ -441,15 +442,104 @@ class LongPollingClient implements ProtocolClient {
 }
 
 // ============================================================================
+// WebTransport client
+// ============================================================================
+//
+// Requires --unstable-net. Uses a single bidirectional stream held open for
+// the full benchmark run. Closed-loop depth=1: write payload, await echo,
+// record RTT, repeat — identical methodology to WebSocketClient.
+//
+// serverCertificateHashes authenticates the self-signed cert by its SHA-256
+// fingerprint instead of the Web PKI chain, which is the correct approach for
+// a controlled test network. The hash ArrayBuffer is computed once in main()
+// and passed to every client instance.
+
+function decodePemToDer(pem: string): Uint8Array {
+    const b64 = pem.replace(/-----[^-]+-----/g, '').replace(/\s+/g, '');
+    return Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+}
+
+class WebTransportClient implements ProtocolClient {
+    constructor(
+        private readonly target: string,
+        private readonly clientId: number,
+        private readonly certHash: ArrayBuffer,
+    ) {}
+
+    async run(stopSignal: AbortSignal): Promise<ClientStats> {
+        const stats: ClientStats = { connectTimeMs: -1, echoesOk: 0, errors: 0, rtts: new RttBuffer() };
+        const encoder = new TextEncoder();
+
+        const connectStart = performance.now();
+        let wt: WebTransport;
+        try {
+            wt = new WebTransport(`https://${this.target}`, {
+                serverCertificateHashes: [{ algorithm: 'sha-256', value: this.certHash }],
+                allowPooling: false,
+            });
+            await wt.ready;
+        } catch (err) {
+            stats.errors++;
+            console.error(`[wt client ${this.clientId}] connect failed:`, err);
+            return stats;
+        }
+        stats.connectTimeMs = performance.now() - connectStart;
+
+        let stream: { readable: ReadableStream<Uint8Array>; writable: WritableStream<Uint8Array> };
+        try {
+            stream = await wt.createBidirectionalStream();
+        } catch {
+            stats.errors++;
+            wt.close();
+            return stats;
+        }
+
+        const writer = stream.writable.getWriter();
+        const reader = stream.readable.getReader();
+
+        const onAbort = () => {
+            try { wt.close(); } catch { /* ignore */ }
+        };
+        stopSignal.addEventListener('abort', onAbort);
+
+        try {
+            while (!stopSignal.aborted) {
+                const sendStart = performance.now();
+                try {
+                    await writer.write(encoder.encode(makePayload(this.clientId, Date.now())));
+                    const { value, done } = await reader.read();
+                    if (done) break;
+                    if (value) {
+                        stats.rtts.push(performance.now() - sendStart);
+                        stats.echoesOk++;
+                    }
+                } catch {
+                    if (!stopSignal.aborted) stats.errors++;
+                    break;
+                }
+            }
+        } finally {
+            stopSignal.removeEventListener('abort', onAbort);
+            try { await writer.close(); } catch { /* ignore */ }
+            reader.releaseLock();
+            try { wt.close(); } catch { /* ignore */ }
+        }
+
+        return stats;
+    }
+}
+
+// ============================================================================
 // Client factory
 // ============================================================================
 
-function makeClient(protocol: Protocol, target: string, clientId: number): ProtocolClient {
+function makeClient(protocol: Protocol, target: string, clientId: number, certHash?: ArrayBuffer): ProtocolClient {
     switch (protocol) {
         case 'ws':             return new WebSocketClient(target, clientId);
         case 'sse':            return new SseClient(target, clientId);
         case 'short-polling':  return new ShortPollingClient(target, clientId);
         case 'long-polling':   return new LongPollingClient(target, clientId);
+        case 'webtransport':   return new WebTransportClient(target, clientId, certHash!);
     }
 }
 
@@ -534,12 +624,19 @@ async function main(): Promise<void> {
 
     console.log(`[load_generator] protocol=${args.protocol} target=${args.target} clients=${args.clients} duration=${args.duration}s`);
 
+    let certHash: ArrayBuffer | undefined;
+    if (args.protocol === 'webtransport') {
+        const certPath = new URL('../servers/cert.pem', import.meta.url);
+        const certPem = await Deno.readTextFile(certPath);
+        certHash = await crypto.subtle.digest('SHA-256', decodePemToDer(certPem).buffer as ArrayBuffer);
+    }
+
     const stopController = new AbortController();
     const stopAt = setTimeout(() => stopController.abort(), args.duration * 1000);
 
     const clientPromises: Promise<ClientStats>[] = [];
     for (let i = 0; i < args.clients; i++) {
-        clientPromises.push(makeClient(args.protocol, args.target, i).run(stopController.signal));
+        clientPromises.push(makeClient(args.protocol, args.target, i, certHash).run(stopController.signal));
     }
 
     const runStart = performance.now();
