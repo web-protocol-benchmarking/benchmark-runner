@@ -375,6 +375,12 @@ class ShortPollingClient implements ProtocolClient {
 // transport, matching the short-polling methodology.
 
 class LongPollingClient implements ProtocolClient {
+    // Each instance gets its own 2-slot HTTP connection pool so the hanging
+    // GET and the POST don't compete with other clients for the global pool.
+    // Without isolation, 50 clients × 2 concurrent requests = 100 connections
+    // deadlock the shared pool: GETs hold all slots, POSTs can never connect.
+    private readonly httpClient: Deno.HttpClient = Deno.createHttpClient({ poolSize: 2 });
+
     constructor(private readonly target: string, private readonly clientId: number) {}
 
     async run(stopSignal: AbortSignal): Promise<ClientStats> {
@@ -390,11 +396,14 @@ class LongPollingClient implements ProtocolClient {
         while (!stopSignal.aborted) {
             // Open hanging GET first; the server will only respond once the
             // matching POST arrives.
-            const getPromise = fetch(getUrl, { method: 'GET' });
+            const getPromise = fetch(getUrl, { method: 'GET', client: this.httpClient, signal: stopSignal });
+            // Suppress unhandled-rejection in the microtask gap between here and
+            // the `await getPromise` below — the rejection is re-thrown there.
+            getPromise.catch(() => {});
 
             // Tiny yield so the GET hits the server before the POST. Without
-            // this, both requests can race through Deno's fetch pool and the
-            // POST occasionally arrives first, drawing a 409.
+            // this, both requests can race and the POST occasionally arrives
+            // first, drawing a 409.
             await new Promise((res) => setTimeout(res, 0));
 
             const sendStart = performance.now();
@@ -404,6 +413,8 @@ class LongPollingClient implements ProtocolClient {
                     method: 'POST',
                     body: makePayload(nextId++, Date.now()),
                     headers: { 'Content-Type': 'application/json' },
+                    client: this.httpClient,
+                    signal: stopSignal,
                 });
                 if (!postRes.ok) {
                     stats.errors++;
@@ -412,8 +423,8 @@ class LongPollingClient implements ProtocolClient {
                     await postRes.body?.cancel();
                     postOk = true;
                 }
-            } catch {
-                stats.errors++;
+            } catch (e) {
+                if ((e as Error).name !== 'AbortError') stats.errors++;
             }
 
             // Always await the GET so it doesn't leak, even if the POST failed.
@@ -433,10 +444,11 @@ class LongPollingClient implements ProtocolClient {
                 }
                 stats.rtts.push(now - sendStart);
                 stats.echoesOk++;
-            } catch {
-                stats.errors++;
+            } catch (e) {
+                if ((e as Error).name !== 'AbortError') stats.errors++;
             }
         }
+        this.httpClient.close();
         return stats;
     }
 }
@@ -632,7 +644,9 @@ async function main(): Promise<void> {
     }
 
     const stopController = new AbortController();
-    const stopAt = setTimeout(() => stopController.abort(), args.duration * 1000);
+    // Deno re-throws AbortError from abort() when fetch() calls hold the signal;
+    // catch and discard it — the error surfaces correctly in each client's catch block.
+    const stopAt = setTimeout(() => { try { stopController.abort(); } catch { /* expected */ } }, args.duration * 1000);
 
     const clientPromises: Promise<ClientStats>[] = [];
     for (let i = 0; i < args.clients; i++) {

@@ -27,8 +27,10 @@ LOSS="0%"
 DELAY="0ms"
 SERVER_CMD=""
 CLIENT_CMD=""
+SERVER_CORES=""
+CLIENT_CORES=""
 PIDSTAT_INTERVAL=1
-RESULTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/results"
+RESULTS_DIR="${RESULTS_DIR:-"$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/results"}"
 
 usage() {
     cat >&2 <<EOF
@@ -39,11 +41,13 @@ Required:
   --client CMD       Command to launch the load generator (runs in ns_client).
 
 Options:
-  --duration SECS    Test duration in seconds (default: ${DURATION}).
-  --loss PCT         tc netem packet loss, e.g. "1%" (default: ${LOSS}).
-  --delay MS         tc netem one-way delay, e.g. "20ms" (default: ${DELAY}).
-  --port PORT        Server port (default: ${SERVER_PORT}).
-  -h, --help         Show this message.
+  --duration SECS      Test duration in seconds (default: ${DURATION}).
+  --loss PCT           tc netem packet loss, e.g. "1%" (default: ${LOSS}).
+  --delay MS           tc netem one-way delay, e.g. "20ms" (default: ${DELAY}).
+  --port PORT          Server port (default: ${SERVER_PORT}).
+  --server-cores LIST  taskset -c list for the server process, e.g. "0" (default: unpinned).
+  --client-cores LIST  taskset -c list for the client process, e.g. "1,2" (default: unpinned).
+  -h, --help           Show this message.
 
 Environment exported to children:
   SERVER_IP, CLIENT_IP, SERVER_PORT
@@ -54,14 +58,16 @@ EOF
 # --- Arg parsing --------------------------------------------------------------
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --server)    SERVER_CMD="$2"; shift 2 ;;
-        --client)    CLIENT_CMD="$2"; shift 2 ;;
-        --duration)  DURATION="$2"; shift 2 ;;
-        --loss)      LOSS="$2"; shift 2 ;;
-        --delay)     DELAY="$2"; shift 2 ;;
-        --port)      SERVER_PORT="$2"; shift 2 ;;
-        -h|--help)   usage 0 ;;
-        *)           echo "Unknown argument: $1" >&2; usage 1 ;;
+        --server)        SERVER_CMD="$2";    shift 2 ;;
+        --client)        CLIENT_CMD="$2";    shift 2 ;;
+        --duration)      DURATION="$2";      shift 2 ;;
+        --loss)          LOSS="$2";          shift 2 ;;
+        --delay)         DELAY="$2";         shift 2 ;;
+        --port)          SERVER_PORT="$2";   shift 2 ;;
+        --server-cores)  SERVER_CORES="$2";  shift 2 ;;
+        --client-cores)  CLIENT_CORES="$2";  shift 2 ;;
+        -h|--help)       usage 0 ;;
+        *)               echo "Unknown argument: $1" >&2; usage 1 ;;
     esac
 done
 
@@ -76,15 +82,17 @@ mkdir -p "$RUN_DIR"
 SERVER_PID=""
 CLIENT_PID=""
 PIDSTAT_PID=""
+CLIENT_PIDSTAT_PID=""
 
 cleanup() {
     local ec=$?
     set +e
     echo "[cleanup] tearing down..." >&2
 
-    [[ -n "$CLIENT_PID"  ]] && kill -TERM "$CLIENT_PID"  2>/dev/null
-    [[ -n "$SERVER_PID"  ]] && kill -TERM "$SERVER_PID"  2>/dev/null
-    [[ -n "$PIDSTAT_PID" ]] && kill -TERM "$PIDSTAT_PID" 2>/dev/null
+    [[ -n "$CLIENT_PID"         ]] && kill -TERM "$CLIENT_PID"         2>/dev/null
+    [[ -n "$SERVER_PID"         ]] && kill -TERM "$SERVER_PID"         2>/dev/null
+    [[ -n "$PIDSTAT_PID"        ]] && kill -TERM "$PIDSTAT_PID"        2>/dev/null
+    [[ -n "$CLIENT_PIDSTAT_PID" ]] && kill -TERM "$CLIENT_PIDSTAT_PID" 2>/dev/null
     wait 2>/dev/null
 
     ip netns del "$NS_SERVER" 2>/dev/null
@@ -140,10 +148,17 @@ SERVER_LOG="$RUN_DIR/server.log"
 CLIENT_LOG="$RUN_DIR/client.log"
 PIDSTAT_LOG="$RUN_DIR/pidstat.log"
 
+echo "[run] cpu pinning: server=${SERVER_CORES:-any} client=${CLIENT_CORES:-any}" >&2
 echo "[run] launching server in $NS_SERVER -> $SERVER_LOG" >&2
-ip netns exec "$NS_SERVER" env \
-    SERVER_IP="$SERVER_IP" SERVER_PORT="$SERVER_PORT" \
-    bash -c "$SERVER_CMD" >"$SERVER_LOG" 2>&1 &
+if [[ -n "$SERVER_CORES" ]]; then
+    taskset -c "$SERVER_CORES" ip netns exec "$NS_SERVER" env \
+        SERVER_IP="$SERVER_IP" SERVER_PORT="$SERVER_PORT" \
+        bash -c "$SERVER_CMD" >"$SERVER_LOG" 2>&1 &
+else
+    ip netns exec "$NS_SERVER" env \
+        SERVER_IP="$SERVER_IP" SERVER_PORT="$SERVER_PORT" \
+        bash -c "$SERVER_CMD" >"$SERVER_LOG" 2>&1 &
+fi
 SERVER_PID=$!
 
 # Give the server a moment to bind.
@@ -160,15 +175,72 @@ PIDSTAT_PID=$!
 
 # --- Launch client ------------------------------------------------------------
 echo "[run] launching client in $NS_CLIENT for ${DURATION}s -> $CLIENT_LOG" >&2
-ip netns exec "$NS_CLIENT" env \
-    SERVER_IP="$SERVER_IP" CLIENT_IP="$CLIENT_IP" SERVER_PORT="$SERVER_PORT" \
-    DURATION="$DURATION" RESULTS_DIR="$RUN_DIR" \
-    bash -c "$CLIENT_CMD" >"$CLIENT_LOG" 2>&1 &
+if [[ -n "$CLIENT_CORES" ]]; then
+    taskset -c "$CLIENT_CORES" ip netns exec "$NS_CLIENT" env \
+        SERVER_IP="$SERVER_IP" CLIENT_IP="$CLIENT_IP" SERVER_PORT="$SERVER_PORT" \
+        DURATION="$DURATION" RESULTS_DIR="$RUN_DIR" \
+        bash -c "$CLIENT_CMD" >"$CLIENT_LOG" 2>&1 &
+else
+    ip netns exec "$NS_CLIENT" env \
+        SERVER_IP="$SERVER_IP" CLIENT_IP="$CLIENT_IP" SERVER_PORT="$SERVER_PORT" \
+        DURATION="$DURATION" RESULTS_DIR="$RUN_DIR" \
+        bash -c "$CLIENT_CMD" >"$CLIENT_LOG" 2>&1 &
+fi
 CLIENT_PID=$!
+
+# --- client pidstat (bottleneck verification) ---------------------------------
+CLIENT_PIDSTAT_LOG="$RUN_DIR/client_pidstat.log"
+echo "[run] starting client pidstat (interval=${PIDSTAT_INTERVAL}s) -> $CLIENT_PIDSTAT_LOG" >&2
+pidstat -h -r -u -p "$CLIENT_PID" "$PIDSTAT_INTERVAL" >"$CLIENT_PIDSTAT_LOG" 2>&1 &
+CLIENT_PIDSTAT_PID=$!
 
 # Wait for the client to finish (it owns the test duration).
 wait "$CLIENT_PID"
 CLIENT_RC=$?
+
+# Stop client pidstat so the log is flushed before we parse it.
+# Ignore the wait exit code — pidstat exits non-zero when killed by SIGTERM,
+# and set -e would otherwise abort the script before the saturation check.
+kill -TERM "$CLIENT_PIDSTAT_PID" 2>/dev/null
+wait "$CLIENT_PIDSTAT_PID" 2>/dev/null || true
+CLIENT_PIDSTAT_PID=""
+
+# --- CPU saturation check -----------------------------------------------------
+# Threshold: 90% of the cores allocated to the client. With CLIENT_CORES="1,2"
+# that is 2 cores × 90 = 180% (pidstat reports per-process %CPU uncapped).
+if [[ -f "$CLIENT_PIDSTAT_LOG" ]]; then
+    CORE_COUNT=1
+    if [[ -n "$CLIENT_CORES" ]]; then
+        CORE_COUNT=$(echo "$CLIENT_CORES" | tr ',' '\n' | wc -l)
+    fi
+    THRESHOLD=$(awk -v c="$CORE_COUNT" 'BEGIN { printf "%d", c * 90 }')
+
+    AVG_CPU=$(awk '
+        /^#/      { next }
+        /^[0-9]/  { if ($8+0 > 0) { sum += $8; n++ } }
+        END       { if (n > 0) printf "%.1f", sum/n; else print "0" }
+    ' "$CLIENT_PIDSTAT_LOG")
+
+    PEAK_CPU=$(awk '
+        /^#/      { next }
+        /^[0-9]/  { if ($8+0 > max) max = $8 }
+        END       { printf "%.1f", max+0 }
+    ' "$CLIENT_PIDSTAT_LOG")
+
+    if awk -v avg="$AVG_CPU" -v peak="$PEAK_CPU" -v thr="$THRESHOLD" \
+            'BEGIN { exit !(avg >= thr || peak >= thr) }'; then
+        echo "" >&2
+        echo "╔══════════════════════════════════════════════════════════════════╗" >&2
+        echo "║  !! WARNING: CLIENT CPU SATURATION DETECTED                   !!" >&2
+        echo "║  avg=${AVG_CPU}%  peak=${PEAK_CPU}%  threshold=${THRESHOLD}% (${CORE_COUNT} core(s) x 90%)" >&2
+        echo "║  The load generator may be the bottleneck.                      ║" >&2
+        echo "║  Benchmark data for this run may be INVALID.                    ║" >&2
+        echo "╚══════════════════════════════════════════════════════════════════╝" >&2
+        echo "" >&2
+    else
+        echo "[run] client cpu ok: avg=${AVG_CPU}% peak=${PEAK_CPU}% (threshold=${THRESHOLD}%)" >&2
+    fi
+fi
 
 echo "[run] client exited rc=$CLIENT_RC; results in $RUN_DIR" >&2
 exit "$CLIENT_RC"

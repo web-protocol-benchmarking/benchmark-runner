@@ -41,6 +41,8 @@ createServer({
     port,
     tls: { certPem, keyPem },
     onSession: (session: any) => { handleSession(session); },
+    // Raise handshake rate limits so 50 simultaneous clients don't get 429.
+    rateLimits: { handshakesPerSec: 200, handshakesBurst: 200 },
 });
 
 console.log(`webtransport echo listening on ${host}:${port}`);
