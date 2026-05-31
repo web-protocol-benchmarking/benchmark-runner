@@ -42,9 +42,9 @@ PROTO_LABELS: dict[str, str] = {
     "sse": "SSE",
     "short-polling": "Short-Polling",
     "long-polling": "Long-Polling",
-    "webtransport": "WebTransport\n(Deno native)",
-    "webtransport-vmeansdev": "WebTransport\n(vmeansdev)",
-    "webtransport-fails-components": "WebTransport\n(fails-components)",
+    "webtransport": "WebTransport",
+    "webtransport-vmeansdev": "WebTransport",
+    "webtransport-fails-components": "WebTransport",
 }
 RUNTIME_LABELS: dict[str, str] = {"node": "Node", "deno": "Deno", "bun": "Bun"}
 
@@ -54,9 +54,7 @@ PROTO_ORDER = [
     "SSE",
     "Short-Polling",
     "Long-Polling",
-    "WebTransport\n(Deno native)",
-    "WebTransport\n(vmeansdev)",
-    "WebTransport\n(fails-components)",
+    "WebTransport",
 ]
 
 # ---------------------------------------------------------------------------
@@ -87,6 +85,8 @@ def load_all() -> pd.DataFrame:
         sys.exit(1)
 
     result = pd.concat(frames, ignore_index=True)
+    # Drop bun/webtransport-fails-components entirely — only vmeansdev represents Bun WebTransport.
+    result = result[~((result["Runtime"] == "bun") & (result["ProtocolVariant"] == "webtransport-fails-components"))]
     result["RuntimeLabel"] = result["Runtime"].map(RUNTIME_LABELS)
     result["ProtoLabel"] = result["ProtocolVariant"].map(PROTO_LABELS)
     return result
@@ -271,8 +271,7 @@ CDF_RUNS = [
     ("bun",  "ws",                            "Bun WS (baseline)",               "#F472B6", "--",  1.8,  0.6),
     ("deno", "webtransport",                  "Deno WebTransport (native)",       "#1A1A1A", "-",   2.4,  1.0),
     ("node", "webtransport-fails-components", "Node WebTransport (fails-components)",           "#339933", "-",   2.4,  1.0),
-    ("bun",  "webtransport-fails-components", "Bun WebTransport (fails-components)",            "#F472B6", "-",   2.4,  1.0),
-    ("bun",  "webtransport-vmeansdev",        "Bun WebTransport (vmeansdev)",     "#c4448c", "-",   2.4,  1.0),
+    ("bun",  "webtransport-vmeansdev",        "Bun WebTransport (vmeansdev)",     "#F472B6", "-",   2.4,  1.0),
 ]
 
 _RNG = np.random.default_rng(42)
@@ -367,8 +366,7 @@ CPU_RUNS = [
     ("bun",  "ws",                            "Bun WS (baseline)",               "#F472B6", "--", 1.5, 0.6),
     ("deno", "webtransport",                  "Deno WebTransport (native)",       "#1A1A1A", "-",  2.0, 1.0),
     ("node", "webtransport-fails-components", "Node WebTransport (fails-components)",           "#339933", "-",  2.0, 1.0),
-    ("bun",  "webtransport-fails-components", "Bun WebTransport (fails-components)",            "#F472B6", "-",  2.0, 1.0),
-    ("bun",  "webtransport-vmeansdev",        "Bun WebTransport (vmeansdev)",     "#c4448c", "-", 2.0, 1.0),
+    ("bun",  "webtransport-vmeansdev",        "Bun WebTransport (vmeansdev)",     "#F472B6", "-",  2.0, 1.0),
 ]
 
 
