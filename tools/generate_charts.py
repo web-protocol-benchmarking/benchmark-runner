@@ -11,6 +11,7 @@ Charts produced in results/charts/:
   chart3_latency_cdf.png             — RTT CDF for selected runs (ideal)
   chart4_cpu_over_time.png           — Server CPU % over time for WebTransport runs (ideal)
   chart5_connect_time.png            — Mean connection establishment time by protocol/runtime (ideal)
+  chart6_cpu_efficiency.png          — Throughput per 1% server CPU by protocol/runtime (ideal)
 
 Usage:
     python tools/generate_charts.py
@@ -250,6 +251,94 @@ def chart_connect_time(df: pd.DataFrame, out_dir: Path) -> None:
     ax.grid(axis="y", which="both", linestyle="--", alpha=0.4)
     plt.tight_layout()
     out_path = out_dir / "chart5_connect_time.png"
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    print(f"  wrote {out_path}")
+
+
+# ---------------------------------------------------------------------------
+# Chart 6 — CPU Efficiency (ideal): throughput per 1% server CPU
+# ---------------------------------------------------------------------------
+
+
+def chart_cpu_efficiency(df: pd.DataFrame, out_dir: Path) -> None:
+    # Restrict to the ideal profile: under netem impairment the server idles
+    # waiting on the wire, deflating CPU and distorting the efficiency ratio.
+    ideal = df[df["Profile"] == "ideal"].copy()
+    if ideal.empty:
+        print("  [warn] no ideal data — skipping chart 6")
+        return
+
+    ideal = ideal[ideal["ProtoLabel"].notna()].copy()
+
+    # Map each ideal run to its run directory so we can read its pidstat.log.
+    run_map = build_run_dir_map("ideal")
+    if not run_map:
+        print("  [warn] no ideal run dirs found — skipping chart 6")
+        return
+
+    records: list[dict] = []
+    for _, row in ideal.iterrows():
+        key = (row["Runtime"], row["ProtocolVariant"])
+        run_dir = run_map.get(key)
+        if run_dir is None:
+            print(f"  [warn] chart 6: no run dir for {key} — skipping")
+            continue
+
+        pidstat_path = run_dir / "pidstat.log"
+        if not pidstat_path.exists():
+            print(f"  [warn] chart 6: {pidstat_path} not found — skipping {key}")
+            continue
+
+        cpu_vals = parse_pidstat(pidstat_path)
+        if not cpu_vals:
+            print(f"  [warn] chart 6: no CPU samples in {pidstat_path} — skipping {key}")
+            continue
+
+        avg_cpu = sum(cpu_vals) / len(cpu_vals)
+        # Guard division by zero: a server pinned to one core that never
+        # registered load gives avg_cpu == 0 — efficiency is undefined.
+        if avg_cpu <= 0:
+            print(f"  [warn] chart 6: avg CPU is {avg_cpu} for {key} — skipping (div-by-zero)")
+            continue
+
+        records.append({
+            "RuntimeLabel": row["RuntimeLabel"],
+            "ProtoLabel": row["ProtoLabel"],
+            "Efficiency": row["Throughput"] / avg_cpu,
+        })
+
+    if not records:
+        print("  [warn] chart 6: no efficiency data computed — skipping")
+        return
+
+    eff = pd.DataFrame(records)
+
+    present_protos = set(eff["ProtoLabel"].unique())
+    x_order = [p for p in PROTO_ORDER if p in present_protos]
+    runtime_order = ["Node", "Deno", "Bun"]
+
+    fig, ax = plt.subplots(figsize=(15, 7))
+    sns.barplot(
+        data=eff,
+        x="ProtoLabel",
+        y="Efficiency",
+        hue="RuntimeLabel",
+        hue_order=[r for r in runtime_order if r in eff["RuntimeLabel"].unique()],
+        order=x_order,
+        palette=RUNTIME_PALETTE,
+        ax=ax,
+    )
+    ax.set_yscale("log")
+    ax.yaxis.set_major_formatter(ticker.FuncFormatter(lambda x, _: f"{x:,.0f}"))
+    ax.set_title("CPU Efficiency by Protocol — Ideal Network Conditions", fontsize=14, fontweight="bold")
+    ax.set_xlabel("Protocol Variant", fontsize=12)
+    ax.set_ylabel("CPU Efficiency (Msg/sec per 1% CPU, log scale)", fontsize=12)
+    ax.tick_params(axis="x", labelsize=9)
+    ax.legend(title="Runtime", fontsize=10)
+    ax.grid(axis="y", which="both", linestyle="--", alpha=0.4)
+    plt.tight_layout()
+    out_path = out_dir / "chart6_cpu_efficiency.png"
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
     print(f"  wrote {out_path}")
@@ -496,6 +585,7 @@ def main() -> None:
     chart_latency_cdf(out_dir)
     chart_cpu_over_time(out_dir)
     chart_connect_time(df, out_dir)
+    chart_cpu_efficiency(df, out_dir)
 
     print(f"\nDone. Charts in {out_dir}/")
 
