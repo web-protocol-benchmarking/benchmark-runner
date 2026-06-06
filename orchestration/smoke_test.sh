@@ -91,7 +91,7 @@ run_one() {
 
     local header expected_header current_lines new_rows
     header=$(head -n1 "$METRICS_CSV")
-    expected_header="Timestamp,Protocol,Concurrency,DurationSec,Throughput,p50_ms,p95_ms,p99_ms,Errors,Overflows"
+    expected_header="Timestamp,Protocol,Concurrency,DurationSec,Throughput,p50_ms,p95_ms,p99_ms,Errors,Overflows,MeanConnect_ms"
     [[ "$header" == "$expected_header" ]] \
         || fail "${tag}: metrics.csv header mismatch. got: $header"
 

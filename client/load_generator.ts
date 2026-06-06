@@ -586,7 +586,7 @@ function mergeRtts(buffers: RttBuffer[]): Float64Array {
 // CSV output
 // ============================================================================
 
-const METRICS_HEADER = 'Timestamp,Protocol,Concurrency,DurationSec,Throughput,p50_ms,p95_ms,p99_ms,Errors,Overflows\n';
+const METRICS_HEADER = 'Timestamp,Protocol,Concurrency,DurationSec,Throughput,p50_ms,p95_ms,p99_ms,Errors,Overflows,MeanConnect_ms\n';
 
 async function appendMetricsRow(metricsPath: string, row: string): Promise<void> {
     let needsHeader = false;
@@ -705,6 +705,9 @@ async function main(): Promise<void> {
         p99.toFixed(4),
         totalErr,
         totalOverflows,
+        // Empty cell (not the literal "NaN") when every client failed to
+        // connect, so downstream pandas parses it as a missing value.
+        Number.isNaN(meanConnect) ? '' : meanConnect.toFixed(4),
     ].join(',') + '\n';
 
     await appendMetricsRow(metricsPath, row);

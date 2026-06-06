@@ -10,6 +10,7 @@ Charts produced in results/charts/:
   chart2_packet_loss_resilience.png  — WS vs WebTransport ideal vs packet_loss (log scale)
   chart3_latency_cdf.png             — RTT CDF for selected runs (ideal)
   chart4_cpu_over_time.png           — Server CPU % over time for WebTransport runs (ideal)
+  chart5_connect_time.png            — Mean connection establishment time by protocol/runtime (ideal)
 
 Usage:
     python tools/generate_charts.py
@@ -191,6 +192,64 @@ def chart_throughput_by_protocol(df: pd.DataFrame, out_dir: Path) -> None:
     ax.grid(axis="y", which="both", linestyle="--", alpha=0.4)
     plt.tight_layout()
     out_path = out_dir / "chart1_throughput_by_protocol.png"
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    print(f"  wrote {out_path}")
+
+
+# ---------------------------------------------------------------------------
+# Chart 5 — Connection Establishment Time (ideal, linear scale)
+# ---------------------------------------------------------------------------
+
+
+def chart_connect_time(df: pd.DataFrame, out_dir: Path) -> None:
+    # Restrict to the ideal profile: injected netem delays in the other
+    # profiles inflate the handshake and muddy the baseline connect cost.
+    if "MeanConnect_ms" not in df.columns:
+        print("  [warn] no MeanConnect_ms column in metrics.csv (pre-instrumentation data) — skipping chart 5")
+        return
+
+    ideal = df[df["Profile"] == "ideal"].copy()
+    if ideal.empty:
+        print("  [warn] no ideal data — skipping chart 5")
+        return
+
+    # Keep only rows with a known protocol label and a recorded connect time.
+    # MeanConnect_ms is blank (NaN) when every client failed to connect.
+    ideal = ideal[ideal["ProtoLabel"].notna()].copy()
+    ideal["MeanConnect_ms"] = pd.to_numeric(ideal["MeanConnect_ms"], errors="coerce")
+    ideal = ideal[ideal["MeanConnect_ms"].notna()].copy()
+    if ideal.empty:
+        print("  [warn] no MeanConnect_ms data — skipping chart 5")
+        return
+
+    present_protos = set(ideal["ProtoLabel"].unique())
+    x_order = [p for p in PROTO_ORDER if p in present_protos]
+
+    runtime_order = ["Node", "Deno", "Bun"]
+
+    fig, ax = plt.subplots(figsize=(15, 7))
+    sns.barplot(
+        data=ideal,
+        x="ProtoLabel",
+        y="MeanConnect_ms",
+        hue="RuntimeLabel",
+        hue_order=[r for r in runtime_order if r in ideal["RuntimeLabel"].unique()],
+        order=x_order,
+        palette=RUNTIME_PALETTE,
+        ax=ax,
+    )
+    # Linear scale: connect times are small (~ms) and a log axis would
+    # exaggerate near-zero handshakes; we want the absolute cost visible.
+    ax.yaxis.set_major_formatter(ticker.FuncFormatter(lambda x, _: f"{x:,.2f}"))
+    ax.set_title("Connection Establishment Time by Protocol — Ideal Network Conditions", fontsize=14, fontweight="bold")
+    ax.set_xlabel("Protocol Variant", fontsize=12)
+    ax.set_ylabel("Mean Connection Time (ms)", fontsize=12)
+    ax.tick_params(axis="x", labelsize=9)
+    ax.legend(title="Runtime", fontsize=10)
+    ax.grid(axis="y", which="both", linestyle="--", alpha=0.4)
+    plt.tight_layout()
+    out_path = out_dir / "chart5_connect_time.png"
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
     print(f"  wrote {out_path}")
@@ -436,6 +495,7 @@ def main() -> None:
     chart_packet_loss_resilience(df, out_dir)
     chart_latency_cdf(out_dir)
     chart_cpu_over_time(out_dir)
+    chart_connect_time(df, out_dir)
 
     print(f"\nDone. Charts in {out_dir}/")
 
