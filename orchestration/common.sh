@@ -17,7 +17,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # --- Matrix variables ---------------------------------------------------------
 RUNTIMES=(node deno bun)
 PROTOCOLS_NODE=(ws sse short-polling long-polling webtransport-fails-components)
-PROTOCOLS_BUN=(ws sse short-polling long-polling webtransport-vmeansdev webtransport-fails-components)
+PROTOCOLS_BUN=(ws sse short-polling long-polling webtransport-vmeansdev)
 PROTOCOLS_DENO=(ws sse short-polling long-polling webtransport)
 BASE_PORT=8080
 
@@ -105,9 +105,6 @@ run_preflight() {
     fi
     if [[ ! -d "$REPO_ROOT/servers/bun/node_modules/@webtransport-bun" ]]; then
         fail "@webtransport-bun/webtransport not installed. Run: (cd $REPO_ROOT/servers/bun && bun install)"
-    fi
-    if [[ ! -d "$REPO_ROOT/servers/bun/node_modules/@fails-components/webtransport" ]]; then
-        fail "@fails-components/webtransport not installed in bun. Run: (cd $REPO_ROOT/servers/bun && bun add @fails-components/webtransport @fails-components/webtransport-transport-http3-quiche && bun pm trust @fails-components/webtransport-transport-http3-quiche)"
     fi
 
     ok "pre-flight checks passed (node, deno, bun, pidstat, all server sources)"

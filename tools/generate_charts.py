@@ -85,8 +85,6 @@ def load_all() -> pd.DataFrame:
         sys.exit(1)
 
     result = pd.concat(frames, ignore_index=True)
-    # Drop bun/webtransport-fails-components entirely — only vmeansdev represents Bun WebTransport.
-    result = result[~((result["Runtime"] == "bun") & (result["ProtocolVariant"] == "webtransport-fails-components"))]
     result["RuntimeLabel"] = result["Runtime"].map(RUNTIME_LABELS)
     result["ProtoLabel"] = result["ProtocolVariant"].map(PROTO_LABELS)
     return result

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # smoke_test.sh — End-to-end pipeline validation across the full runtime x
-# protocol matrix (3 runtimes x 3 protocols = 9 combinations).
+# protocol matrix (15 runtime+protocol combinations).
 #
 # Each combination drives a 2-second / 2-client echo run through run_test.sh
 # with no network impairment, then asserts that the resulting metrics.csv
@@ -26,9 +26,9 @@ METRICS_CSV="$RESULTS_DIR/metrics.csv"
 # Deno webtransport-fails-components is excluded: the package uses internal Node.js
 # socket APIs (getSendQueueCount) that Deno's compat layer does not implement.
 #   node:  ws sse short-polling long-polling webtransport-fails-components          (5)
-#   bun:   ws sse short-polling long-polling webtransport-vmeansdev wt-fc           (6)
+#   bun:   ws sse short-polling long-polling webtransport-vmeansdev                 (5)
 #   deno:  ws sse short-polling long-polling webtransport                           (5)
-# Total: 16 combinations.
+# Total: 15 combinations.
 DURATION=2
 CLIENTS=2
 MIN_RTT_SAMPLES=10
@@ -145,7 +145,7 @@ run_one() {
 }
 
 # --- Drive the full matrix ----------------------------------------------------
-yellow "[smoke] matrix: 16 combinations (node×5, bun×6, deno×5)"
+yellow "[smoke] matrix: 15 combinations (node×5, bun×5, deno×5)"
 yellow "[smoke] per-run: ${DURATION}s, ${CLIENTS} clients, loss=0%, delay=0ms"
 echo ""
 

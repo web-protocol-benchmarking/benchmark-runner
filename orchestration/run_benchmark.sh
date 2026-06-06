@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
-# run_benchmark.sh — Full thesis sweep: 3 network profiles x 16 runtime+protocol
-# combos = 48 timed runs.
+# run_benchmark.sh — Full thesis sweep: 3 network profiles x 15 runtime+protocol
+# combos = 45 timed runs.
 #
 # Per-profile output is routed to results/<profile>/ with a metrics.csv and an
 # annotations.csv sidecar (Timestamp,Runtime,ProtocolVariant) that the chart
@@ -95,7 +95,7 @@ run_one_benchmark() {
 # Use ports starting at 8200 to avoid TIME_WAIT collision with smoke (8080–8095).
 BENCHMARK_BASE_PORT=8200
 
-yellow "[bench] Starting full sweep: ${#PROFILE_NAMES[@]} profiles x 16 combos = 48 runs"
+yellow "[bench] Starting full sweep: ${#PROFILE_NAMES[@]} profiles x 15 combos = 45 runs"
 yellow "[bench] duration=${DURATION}s  clients=${CLIENTS}  server_cores=${SERVER_CORES}  client_cores=${CLIENT_CORES}"
 echo ""
 
