@@ -29,6 +29,7 @@ SERVER_CMD=""
 CLIENT_CMD=""
 SERVER_CORES=""
 CLIENT_CORES=""
+PROFILE=0
 PIDSTAT_INTERVAL=1
 RESULTS_DIR="${RESULTS_DIR:-"$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/results"}"
 
@@ -47,6 +48,8 @@ Options:
   --port PORT          Server port (default: ${SERVER_PORT}).
   --server-cores LIST  taskset -c list for the server process, e.g. "0" (default: unpinned).
   --client-cores LIST  taskset -c list for the client process, e.g. "1,2" (default: unpinned).
+  --profile            Wrap the server in 'perf record -F 99 -g' and, after the run,
+                       render \$RUN_DIR/flamegraph.svg from the captured perf.data.
   -h, --help           Show this message.
 
 Environment exported to children:
@@ -66,6 +69,7 @@ while [[ $# -gt 0 ]]; do
         --port)          SERVER_PORT="$2";   shift 2 ;;
         --server-cores)  SERVER_CORES="$2";  shift 2 ;;
         --client-cores)  CLIENT_CORES="$2";  shift 2 ;;
+        --profile)       PROFILE=1;          shift 1 ;;
         -h|--help)       usage 0 ;;
         *)               echo "Unknown argument: $1" >&2; usage 1 ;;
     esac
@@ -93,7 +97,24 @@ cleanup() {
     [[ -n "$SERVER_PID"         ]] && kill -TERM "$SERVER_PID"         2>/dev/null
     [[ -n "$PIDSTAT_PID"        ]] && kill -TERM "$PIDSTAT_PID"        2>/dev/null
     [[ -n "$CLIENT_PIDSTAT_PID" ]] && kill -TERM "$CLIENT_PIDSTAT_PID" 2>/dev/null
+    # wait blocks until perf (the server's parent when profiling) has caught
+    # SIGTERM and flushed perf.data, so the flamegraph pipeline below sees a
+    # complete capture.
     wait 2>/dev/null
+
+    # --- Flamegraph generation (profiling runs only) -------------------------
+    if [[ "${PROFILE:-0}" -eq 1 && -f "${PERF_DATA:-}" ]]; then
+        echo "[cleanup] perf.data found; rendering flamegraph..." >&2
+        if perf script -i "$PERF_DATA" \
+                | stackcollapse-perf.pl \
+                | flamegraph.pl > "$RUN_DIR/flamegraph.svg" 2>"$RUN_DIR/flamegraph.err"; then
+            echo "[cleanup] wrote $RUN_DIR/flamegraph.svg" >&2
+            rm -f "$RUN_DIR/flamegraph.err"
+        else
+            echo "[cleanup] WARN: flamegraph pipeline failed; see $RUN_DIR/flamegraph.err" >&2
+            rm -f "$RUN_DIR/flamegraph.svg"
+        fi
+    fi
 
     ip netns del "$NS_SERVER" 2>/dev/null
     ip netns del "$NS_CLIENT" 2>/dev/null
@@ -148,16 +169,27 @@ SERVER_LOG="$RUN_DIR/server.log"
 CLIENT_LOG="$RUN_DIR/client.log"
 PIDSTAT_LOG="$RUN_DIR/pidstat.log"
 
+# When profiling, wrap the server in perf record. perf must sit *inside* the
+# netns exec / taskset so it profiles the actual server subtree (and inherits
+# the same core pinning); -g captures call graphs, -F 99 keeps overhead low.
+# On SIGTERM (sent by the cleanup trap) perf flushes perf.data and exits.
+PERF_DATA="$RUN_DIR/perf.data"
+PERF_PREFIX=()
+if [[ "$PROFILE" -eq 1 ]]; then
+    PERF_PREFIX=(perf record -F 99 -g -o "$PERF_DATA" --)
+fi
+
 echo "[run] cpu pinning: server=${SERVER_CORES:-any} client=${CLIENT_CORES:-any}" >&2
+[[ "$PROFILE" -eq 1 ]] && echo "[run] profiling enabled: perf record -F 99 -g -> $PERF_DATA" >&2
 echo "[run] launching server in $NS_SERVER -> $SERVER_LOG" >&2
 if [[ -n "$SERVER_CORES" ]]; then
     taskset -c "$SERVER_CORES" ip netns exec "$NS_SERVER" env \
         SERVER_IP="$SERVER_IP" SERVER_PORT="$SERVER_PORT" \
-        bash -c "$SERVER_CMD" >"$SERVER_LOG" 2>&1 &
+        "${PERF_PREFIX[@]}" bash -c "$SERVER_CMD" >"$SERVER_LOG" 2>&1 &
 else
     ip netns exec "$NS_SERVER" env \
         SERVER_IP="$SERVER_IP" SERVER_PORT="$SERVER_PORT" \
-        bash -c "$SERVER_CMD" >"$SERVER_LOG" 2>&1 &
+        "${PERF_PREFIX[@]}" bash -c "$SERVER_CMD" >"$SERVER_LOG" 2>&1 &
 fi
 SERVER_PID=$!
 
