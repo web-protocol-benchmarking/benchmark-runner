@@ -60,11 +60,31 @@ mkdir -p "$PROFILING_DIR"
 # --- Run a single profiled combination ----------------------------------------
 FAILURES=0
 
+# Human-readable label for the flamegraph title (matches chart legend wording).
+profile_label() {
+    local runtime="$1" proto="$2"
+    local rt_name
+    case "$runtime" in
+        node) rt_name="Node" ;;
+        deno) rt_name="Deno" ;;
+        bun)  rt_name="Bun" ;;
+        *)    rt_name="$runtime" ;;
+    esac
+    case "$proto" in
+        ws)                            echo "$rt_name WebSocket" ;;
+        webtransport)                  echo "$rt_name WebTransport (native)" ;;
+        webtransport-fails-components) echo "$rt_name WebTransport (fails-components)" ;;
+        webtransport-vmeansdev)        echo "$rt_name WebTransport (vmeansdev)" ;;
+        *)                             echo "$rt_name $proto" ;;
+    esac
+}
+
 run_one_profile() {
     local runtime="$1" proto="$2" port="$3"
 
-    local server_cmd
+    local server_cmd label
     server_cmd=$(server_cmd_for "$runtime" "$proto")
+    label=$(profile_label "$runtime" "$proto")
 
     # All webtransport variants drive the client with --protocol webtransport.
     local client_proto="$proto"
@@ -89,7 +109,8 @@ run_one_profile() {
             --port    "$port" \
             --server-cores "$SERVER_CORES" \
             --client-cores "$CLIENT_CORES" \
-            --profile; then
+            --profile \
+            --label "$label"; then
         red "  WARN: ideal | $runtime $proto — run_test.sh exited non-zero" >&2
         FAILURES=$(( FAILURES + 1 ))
         return

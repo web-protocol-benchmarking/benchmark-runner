@@ -30,6 +30,7 @@ CLIENT_CMD=""
 SERVER_CORES=""
 CLIENT_CORES=""
 PROFILE=0
+LABEL=""
 PIDSTAT_INTERVAL=1
 RESULTS_DIR="${RESULTS_DIR:-"$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/results"}"
 
@@ -50,6 +51,9 @@ Options:
   --client-cores LIST  taskset -c list for the client process, e.g. "1,2" (default: unpinned).
   --profile            Wrap the server in 'perf record -F 99 -g' and, after the run,
                        render \$RUN_DIR/flamegraph.svg from the captured perf.data.
+  --label TEXT         Descriptive label used as the flamegraph title (with --profile),
+                       e.g. "Node WebTransport (fails-components)". Falls back to a
+                       generic title if omitted.
   -h, --help           Show this message.
 
 Environment exported to children:
@@ -70,6 +74,7 @@ while [[ $# -gt 0 ]]; do
         --server-cores)  SERVER_CORES="$2";  shift 2 ;;
         --client-cores)  CLIENT_CORES="$2";  shift 2 ;;
         --profile)       PROFILE=1;          shift 1 ;;
+        --label)         LABEL="$2";         shift 2 ;;
         -h|--help)       usage 0 ;;
         *)               echo "Unknown argument: $1" >&2; usage 1 ;;
     esac
@@ -105,9 +110,18 @@ cleanup() {
     # --- Flamegraph generation (profiling runs only) -------------------------
     if [[ "${PROFILE:-0}" -eq 1 && -f "${PERF_DATA:-}" ]]; then
         echo "[cleanup] perf.data found; rendering flamegraph..." >&2
+        # Descriptive title from --label (falls back to generic); subtitle carries
+        # the network conditions so the SVG is self-documenting.
+        local fg_title_args=()
+        if [[ -n "${LABEL:-}" ]]; then
+            # ASCII-only title text. A non-ASCII dash gets double-UTF-8-encoded
+            # somewhere in the bash -> perl -> SVG path and renders as mojibake.
+            fg_title_args=(--title "$LABEL - Server CPU" \
+                           --subtitle "perf -F99 -g | loss=${LOSS} delay=${DELAY} | ${RUN_TAG}")
+        fi
         if perf script -i "$PERF_DATA" \
                 | stackcollapse-perf.pl \
-                | flamegraph.pl > "$RUN_DIR/flamegraph.svg" 2>"$RUN_DIR/flamegraph.err"; then
+                | flamegraph.pl "${fg_title_args[@]}" > "$RUN_DIR/flamegraph.svg" 2>"$RUN_DIR/flamegraph.err"; then
             echo "[cleanup] wrote $RUN_DIR/flamegraph.svg" >&2
             rm -f "$RUN_DIR/flamegraph.err"
         else
@@ -158,8 +172,13 @@ ip netns exec "$NS_CLIENT" tc qdisc add dev "$VETH_CLIENT" root netem \
     delay "$DELAY" loss "$LOSS"
 
 # --- Connectivity smoke test --------------------------------------------------
-if ! ip netns exec "$NS_CLIENT" ping -c1 -W2 "$SERVER_IP" >/dev/null; then
-    echo "[setup] sanity ping failed; aborting." >&2
+# Send several pings and require only ONE to return. A single -c1 probe is too
+# fragile under the netem impairment we deliberately inject: at 50ms delay +
+# 2-10% loss a lone packet is routinely dropped, aborting an otherwise-healthy
+# run before launch. -c5 with a per-packet -W2 tolerates loss while still
+# catching a genuinely broken topology (all 5 dropped => exit).
+if ! ip netns exec "$NS_CLIENT" ping -c5 -W2 "$SERVER_IP" >/dev/null; then
+    echo "[setup] sanity ping failed (0/5 replies); aborting." >&2
     exit 1
 fi
 

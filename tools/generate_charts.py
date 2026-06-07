@@ -12,6 +12,7 @@ Charts produced in results/charts/:
   chart4_cpu_over_time.png           — Server CPU % over time for WebTransport runs (ideal)
   chart5_connect_time.png            — Mean connection establishment time by protocol/runtime (ideal)
   chart6_cpu_efficiency.png          — Throughput per 1% server CPU by protocol/runtime (ideal)
+  chart7_crossover.png               — Throughput vs packet loss at 50ms latency (crossover sweep)
 
 Usage:
     python tools/generate_charts.py
@@ -34,7 +35,7 @@ import seaborn as sns
 
 REPO_ROOT = Path(__file__).parent.parent
 RESULTS_BASE = REPO_ROOT / "results"
-PROFILES = ["ideal", "high_latency", "packet_loss"]
+PROFILES = ["ideal", "high_latency", "packet_loss", "crossover"]
 
 RUNTIME_PALETTE = {"Node": "#339933", "Deno": "#1A1A1A", "Bun": "#F472B6"}
 PROFILE_PALETTE = {"Ideal": "#4c8eda", "Packet Loss (1%, 20ms)": "#e05c5c"}
@@ -345,6 +346,90 @@ def chart_cpu_efficiency(df: pd.DataFrame, out_dir: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Chart 7 — Crossover: throughput vs packet loss at fixed 50ms latency
+# ---------------------------------------------------------------------------
+
+
+def chart_crossover(df: pd.DataFrame, out_dir: Path) -> None:
+    cross = df[df["Profile"] == "crossover"].copy()
+    if cross.empty:
+        print("  [warn] no crossover data — skipping chart 7 (run orchestration/run_crossover.sh)")
+        return
+
+    # PacketLoss arrives from the crossover annotations.csv 4th column.
+    if "PacketLoss" not in cross.columns:
+        print("  [warn] crossover data has no PacketLoss column — skipping chart 7")
+        return
+
+    cross = cross[cross["ProtoLabel"].notna()].copy()
+    cross["PacketLoss"] = pd.to_numeric(cross["PacketLoss"], errors="coerce")
+    cross = cross[cross["PacketLoss"].notna()].copy()
+
+    # The crossover thesis is strictly WebSocket (TCP) vs WebTransport (QUIC);
+    # the polling/SSE protocols only clutter the chart and bury the comparison.
+    cross = cross[cross["ProtoLabel"].isin(["WebSocket", "WebTransport"])].copy()
+    if cross.empty:
+        print("  [warn] no usable WS/WebTransport crossover rows — skipping chart 7")
+        return
+
+    # One line per Runtime+Protocol; average throughput if a (group, loss) pair
+    # was sampled more than once.
+    cross["Series"] = cross["RuntimeLabel"] + " " + cross["ProtoLabel"]
+    grouped = (
+        cross.groupby(["Series", "RuntimeLabel", "ProtoLabel", "PacketLoss"])["Throughput"]
+        .mean()
+        .reset_index()
+    )
+
+    fig, ax = plt.subplots(figsize=(13, 8))
+
+    # WebSocket lines dashed (the TCP baseline that should collapse);
+    # WebTransport lines solid + thicker (the QUIC contender that should hold up).
+    for series, g in grouped.groupby("Series"):
+        g = g.sort_values("PacketLoss")
+        runtime = g["RuntimeLabel"].iloc[0]
+        proto = g["ProtoLabel"].iloc[0]
+        color = RUNTIME_PALETTE.get(runtime, "#888888")
+        is_wt = proto == "WebTransport"
+        ax.plot(
+            g["PacketLoss"],
+            g["Throughput"],
+            label=series,
+            color=color,
+            linestyle="-" if is_wt else "--",
+            linewidth=2.6 if is_wt else 1.6,
+            marker="o" if is_wt else "x",
+            markersize=6 if is_wt else 5,
+            alpha=1.0 if is_wt else 0.7,
+        )
+
+    # Linear y-axis: at depth-1 with 50ms latency the closed-loop throughput is
+    # RTT-bound (~250-470 msg/s), so the dynamic range is small and a log scale
+    # would flatten the crossover. Switch to log only if a future config makes
+    # the WS drop-off span orders of magnitude.
+    ax.yaxis.set_major_formatter(ticker.FuncFormatter(lambda x, _: f"{x:,.0f}"))
+    ax.set_ylim(bottom=0)
+    # Pin ticks to the swept loss levels actually present.
+    loss_ticks = sorted(grouped["PacketLoss"].unique())
+    ax.set_xticks(loss_ticks)
+    ax.set_xticklabels([f"{int(v) if v == int(v) else v}%" for v in loss_ticks])
+    ax.set_title(
+        "Crossover — Throughput vs Packet Loss at 50ms Latency\n"
+        "(dashed = WebSocket / TCP, solid = WebTransport / QUIC)",
+        fontsize=13, fontweight="bold",
+    )
+    ax.set_xlabel("Packet Loss (%)", fontsize=12)
+    ax.set_ylabel("Throughput (msg/s)", fontsize=12)
+    ax.legend(title="Runtime / Protocol", fontsize=9, ncol=2)
+    ax.grid(which="both", linestyle="--", alpha=0.4)
+    plt.tight_layout()
+    out_path = out_dir / "chart7_crossover.png"
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    print(f"  wrote {out_path}")
+
+
+# ---------------------------------------------------------------------------
 # Chart 2 — Packet Loss Resilience (log scale)
 # ---------------------------------------------------------------------------
 
@@ -586,6 +671,7 @@ def main() -> None:
     chart_cpu_over_time(out_dir)
     chart_connect_time(df, out_dir)
     chart_cpu_efficiency(df, out_dir)
+    chart_crossover(df, out_dir)
 
     print(f"\nDone. Charts in {out_dir}/")
 

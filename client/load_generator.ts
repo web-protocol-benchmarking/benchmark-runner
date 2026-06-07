@@ -489,6 +489,12 @@ class WebTransportClient implements ProtocolClient {
                 serverCertificateHashes: [{ algorithm: 'sha-256', value: this.certHash }],
                 allowPooling: false,
             });
+            // Consume wt.closed's rejection. On a handshake timeout under loss
+            // both wt.ready AND wt.closed reject; the catch below handles ready,
+            // but an unhandled wt.closed rejection would crash the whole Deno
+            // process (taking the other 49 clients with it). No-op handler only
+            // — this changes nothing about the echo loop, depth, or streams.
+            wt.closed.catch(() => { /* recorded via the ready/echo paths */ });
             await wt.ready;
         } catch (err) {
             stats.errors++;
@@ -631,6 +637,23 @@ async function writeRawRtts(rawPath: string, clientStats: ClientStats[]): Promis
 
 async function main(): Promise<void> {
     const args = parseArgs(Deno.args);
+
+    // Under heavy packet loss, Deno's WebTransport surfaces handshake timeouts
+    // via internal promises (wt.ready / wt.closed and others) whose rejections
+    // can escape the per-client try/catch on a different microtask tick, landing
+    // as a process-fatal "Uncaught (in promise)". A failed client is already
+    // recorded as stats.errors and must NOT abort the other 49. Swallow ONLY
+    // these timeout/WebTransport rejections here; anything else is re-thrown so
+    // real bugs still crash loudly. This is pure robustness — it does not touch
+    // the echo loop, pipeline depth, or stream handling.
+    globalThis.addEventListener('unhandledrejection', (e: PromiseRejectionEvent) => {
+        const r = e.reason;
+        const name = r?.name ?? '';
+        const msg = String(r?.message ?? r ?? '');
+        if (name === 'WebTransportError' || /timed out/i.test(msg)) {
+            e.preventDefault();
+        }
+    });
 
     await Deno.mkdir(args.resultsDir, { recursive: true });
 
