@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 #
-# run_profiling.sh — Targeted CPU profiling sweep for flamegraph generation.
+# sweep_profiling.sh — Targeted CPU profiling sweep for flamegraph generation.
+# Driver: calls the core harness (harness_run_test.sh) with --profile.
 #
-# Unlike run_benchmark.sh (the full 45-run matrix), this profiles only the
+# Unlike sweep_benchmark.sh (the full 45-run matrix), this profiles only the
 # WebSocket baseline vs the WebTransport implementation for each runtime, under
 # the IDEAL network profile ONLY (no loss/delay). perf adds observer overhead
 # and produces large perf.data files, so we deliberately keep the set small.
 #
-# Each run is launched through run_test.sh with --profile, which wraps the
+# Each run is launched through harness_run_test.sh with --profile, which wraps the
 # server in 'perf record -F 99 -g' and renders a flamegraph.svg per run.
 #
 # Output is routed to results/profiling/ (one per-run dir per combination),
@@ -20,7 +21,7 @@ set -euo pipefail
 # --- Paths --------------------------------------------------------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/common.sh"
-RUN_TEST="$SCRIPT_DIR/run_test.sh"
+RUN_TEST="$SCRIPT_DIR/harness_run_test.sh"
 CLIENT_SCRIPT="$REPO_ROOT/client/load_generator.ts"
 RESULTS_BASE="$REPO_ROOT/results"
 PROFILING_DIR="$RESULTS_BASE/profiling"
@@ -29,7 +30,7 @@ PROFILING_DIR="$RESULTS_BASE/profiling"
 # 15s is plenty of wall-clock to collect a representative flamegraph without
 # bloating perf.data. Same concurrency / core pinning as the full sweep so the
 # captured profile reflects the same load shape.
-DURATION=15
+DURATION=5
 CLIENTS=50
 SERVER_CORES="0"
 CLIENT_CORES="1,2"
@@ -38,6 +39,10 @@ CLIENT_CORES="1,2"
 # obscure the FFI/crypto CPU cost we are trying to visualise.
 LOSS="0%"
 DELAY="0ms"
+
+# One UTC stamp for the whole sweep — passed to every run as its dir-name prefix
+# so all dirs from this invocation group together.
+SWEEP_STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 
 # --- Targeted combinations: WS baseline vs WT impl, per runtime ---------------
 # Parallel arrays: PROFILE_RUNTIMES[i] runs PROFILE_PROTOS[i].
@@ -110,8 +115,12 @@ run_one_profile() {
             --server-cores "$SERVER_CORES" \
             --client-cores "$CLIENT_CORES" \
             --profile \
-            --label "$label"; then
-        red "  WARN: ideal | $runtime $proto — run_test.sh exited non-zero" >&2
+            --label "$label" \
+            --bench-profile profiling \
+            --runtime "$runtime" \
+            --variant "$proto" \
+            --sweep-stamp "$SWEEP_STAMP"; then
+        red "  WARN: ideal | $runtime $proto — harness_run_test.sh exited non-zero" >&2
         FAILURES=$(( FAILURES + 1 ))
         return
     fi

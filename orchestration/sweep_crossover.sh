@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
 #
-# run_crossover.sh — Packet-loss crossover sweep at fixed latency.
+# sweep_crossover.sh — Packet-loss crossover sweep at fixed latency. Driver:
+# loops loss levels x WS/WT combos and calls the core harness (harness_run_test.sh).
 #
-# Holds one-way delay flat at 50ms and sweeps packet loss across
-# 0/1/2/5/10%, running the full 15-combo matrix at each loss level. The goal
-# is to find the crossover point: WebSocket (kernel TCP) throughput should
-# collapse as loss rises (head-of-line blocking + retransmits), while
+# Holds one-way delay flat at 50ms and sweeps packet loss across 0/1/2/5/10%.
+# The goal is to find the crossover point: WebSocket (kernel TCP) throughput
+# should collapse as loss rises (head-of-line blocking + retransmits), while
 # WebTransport (QUIC) degrades far more gracefully and eventually overtakes it.
 #
-# Output is routed to results/crossover/ with a metrics.csv and an
-# annotations.csv sidecar. Unlike the main benchmark, the annotation carries a
-# 4th PacketLoss column so the chart generator can use loss as the X-axis.
+# Output is routed to results/crossover/metrics.csv. The harness embeds the
+# numeric PacketLossPct directly into each row (from --loss) and writes a
+# metadata.json per run — no annotations.csv sidecar; the chart uses
+# PacketLossPct as its X-axis.
 #
 # Does NOT abort on individual run failures — increments a counter and
 # continues so one flaky run doesn't waste the sweep.
@@ -22,16 +23,20 @@ set -euo pipefail
 # --- Paths --------------------------------------------------------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/common.sh"
-RUN_TEST="$SCRIPT_DIR/run_test.sh"
+RUN_TEST="$SCRIPT_DIR/harness_run_test.sh"
 CLIENT_SCRIPT="$REPO_ROOT/client/load_generator.ts"
 RESULTS_BASE="$REPO_ROOT/results"
 CROSSOVER_DIR="$RESULTS_BASE/crossover"
 
 # --- Benchmark parameters -----------------------------------------------------
-DURATION=10
+DURATION=5
 CLIENTS=50
 SERVER_CORES="0"
 CLIENT_CORES="1,2"
+
+# One UTC stamp for the whole sweep — passed to every run as its dir-name prefix
+# so all dirs from this invocation group together.
+SWEEP_STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 
 # --- Sweep axes ---------------------------------------------------------------
 # Latency held flat; packet loss is the swept variable.
@@ -51,12 +56,6 @@ PROTOS_CROSSOVER_DENO=(ws webtransport)
 run_preflight
 
 mkdir -p "$CROSSOVER_DIR"
-
-METRICS_CSV="$CROSSOVER_DIR/metrics.csv"
-ANNOTATIONS_CSV="$CROSSOVER_DIR/annotations.csv"
-if [[ ! -f "$ANNOTATIONS_CSV" ]]; then
-    printf 'Timestamp,Runtime,ProtocolVariant,PacketLoss\n' > "$ANNOTATIONS_CSV"
-fi
 
 # --- Run a single combination at a given loss level ---------------------------
 FAILURES=0
@@ -88,18 +87,15 @@ run_one_crossover() {
             --delay   "$DELAY" \
             --port    "$port" \
             --server-cores "$SERVER_CORES" \
-            --client-cores "$CLIENT_CORES"; then
-        red "  WARN: loss=$loss | $runtime $proto — run_test.sh exited non-zero (skipping annotation)" >&2
+            --client-cores "$CLIENT_CORES" \
+            --bench-profile crossover \
+            --runtime "$runtime" \
+            --variant "$proto" \
+            --sweep-stamp "$SWEEP_STAMP"; then
+        red "  WARN: loss=$loss | $runtime $proto — harness_run_test.sh exited non-zero" >&2
         FAILURES=$(( FAILURES + 1 ))
         return
     fi
-
-    # Annotate the freshly-appended metrics row with runtime, protocol, and the
-    # numeric loss level (strip the % so the chart axis is numeric).
-    local ts loss_num
-    ts=$(tail -n1 "$METRICS_CSV" | cut -d',' -f1)
-    loss_num="${loss%\%}"
-    printf '%s,%s,%s,%s\n' "$ts" "$runtime" "$proto" "$loss_num" >> "$ANNOTATIONS_CSV"
 
     ok "  DONE: loss=$loss | $runtime $proto"
 }
@@ -143,7 +139,7 @@ green "CROSSOVER SWEEP COMPLETE"
 green "===================="
 echo "Runs:     $(( port_offset ))"
 echo "Failures: $FAILURES"
-echo "Results:  $METRICS_CSV"
+echo "Results:  $CROSSOVER_DIR/metrics.csv"
 
 if (( FAILURES > 0 )); then
     red "$FAILURES run(s) failed — check logs in $CROSSOVER_DIR/" >&2

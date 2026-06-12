@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 #
-# run_benchmark.sh — Full thesis sweep: 3 network profiles x 15 runtime+protocol
-# combos = 45 timed runs.
+# sweep_benchmark.sh — Full thesis sweep: 3 network profiles x 15 runtime+protocol
+# combos = 45 timed runs. Driver: loops the matrix and calls the core harness
+# (harness_run_test.sh) once per combination.
 #
-# Per-profile output is routed to results/<profile>/ with a metrics.csv and an
-# annotations.csv sidecar (Timestamp,Runtime,ProtocolVariant) that the chart
-# generator joins on to add Runtime and Profile dimensions.
+# Per-profile output is routed to results/<profile>/metrics.csv. Each run is
+# fully self-describing: the harness embeds Profile/Runtime/ProtocolVariant/
+# PacketLossPct/DelayMs directly into the metrics row and writes a metadata.json
+# into each run dir — no annotations.csv sidecar.
 #
 # Does NOT abort on individual run failures — increments a failure counter and
 # continues so a single flaky run doesn't waste the rest of the sweep.
@@ -17,15 +19,19 @@ set -euo pipefail
 # --- Paths --------------------------------------------------------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/common.sh"
-RUN_TEST="$SCRIPT_DIR/run_test.sh"
+RUN_TEST="$SCRIPT_DIR/harness_run_test.sh"
 CLIENT_SCRIPT="$REPO_ROOT/client/load_generator.ts"
 RESULTS_BASE="$REPO_ROOT/results"
 
 # --- Benchmark parameters -----------------------------------------------------
-DURATION=5 # TEMP 5s for debugging
+DURATION=5
 CLIENTS=50
 SERVER_CORES="0"
 CLIENT_CORES="1,2"
+
+# One UTC stamp for the whole sweep — passed to every run as its dir-name prefix
+# so all dirs from this invocation group together.
+SWEEP_STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 
 # --- Network profiles (parallel arrays) ---------------------------------------
 #   ideal        — clean network, baseline throughput
@@ -44,14 +50,8 @@ FAILURES=0
 run_one_benchmark() {
     local profile="$1" loss="$2" delay="$3" runtime="$4" proto="$5" port="$6"
     local profile_dir="$RESULTS_BASE/$profile"
-    local metrics_csv="$profile_dir/metrics.csv"
-    local annotations_csv="$profile_dir/annotations.csv"
 
     mkdir -p "$profile_dir"
-
-    if [[ ! -f "$annotations_csv" ]]; then
-        printf 'Timestamp,Runtime,ProtocolVariant\n' > "$annotations_csv"
-    fi
 
     local server_cmd
     server_cmd=$(server_cmd_for "$runtime" "$proto")
@@ -77,16 +77,15 @@ run_one_benchmark() {
             --delay   "$delay" \
             --port    "$port" \
             --server-cores "$SERVER_CORES" \
-            --client-cores "$CLIENT_CORES"; then
-        red "  WARN: $profile | $runtime $proto — run_test.sh exited non-zero (skipping annotation)" >&2
+            --client-cores "$CLIENT_CORES" \
+            --bench-profile "$profile" \
+            --runtime "$runtime" \
+            --variant "$proto" \
+            --sweep-stamp "$SWEEP_STAMP"; then
+        red "  WARN: $profile | $runtime $proto — harness_run_test.sh exited non-zero" >&2
         FAILURES=$(( FAILURES + 1 ))
         return
     fi
-
-    # Capture the timestamp of the freshly-appended metrics row and annotate.
-    local ts
-    ts=$(tail -n1 "$metrics_csv" | cut -d',' -f1)
-    printf '%s,%s,%s\n' "$ts" "$runtime" "$proto" >> "$annotations_csv"
 
     ok "  DONE: $profile | $runtime $proto"
 }

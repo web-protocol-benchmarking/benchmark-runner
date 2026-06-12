@@ -78,7 +78,7 @@ server_cmd_for() {
 run_preflight() {
     [[ $EUID -eq 0 ]] || fail "must be run as root (ip netns / tc require CAP_NET_ADMIN)"
 
-    [[ -x "${RUN_TEST:?}" ]]      || fail "run_test.sh not found or not executable: $RUN_TEST"
+    [[ -x "${RUN_TEST:?}" ]]      || fail "harness_run_test.sh not found or not executable: $RUN_TEST"
     [[ -f "${CLIENT_SCRIPT:?}" ]] || fail "load_generator.ts not found: $CLIENT_SCRIPT"
 
     for bin in node deno bun pidstat taskset; do

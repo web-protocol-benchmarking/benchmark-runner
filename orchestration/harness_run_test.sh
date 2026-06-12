@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 #
-# run_test.sh — Network-namespace benchmark harness.
+# harness_run_test.sh — Network-namespace benchmark harness (the core engine).
+#
+# This is the ONE script that performs the low-level mechanics: ip netns + veth
+# pair, tc netem (loss/delay), taskset CPU pinning, server/client launch, perf
+# profiling. The sweep_*.sh drivers call this once per matrix combination.
 #
 # Creates ns_server and ns_client, connects them with a direct veth pair on a
 # /30 subnet (no bridge, no loopback shortcut), applies symmetric tc netem on
@@ -31,6 +35,12 @@ SERVER_CORES=""
 CLIENT_CORES=""
 PROFILE=0
 LABEL=""
+# Self-describing run dimensions (passed by the sweep_* drivers; empty for
+# standalone runs, in which case the client applies its own placeholders).
+BENCH_PROFILE=""
+RUNTIME=""
+VARIANT=""
+SWEEP_STAMP=""
 PIDSTAT_INTERVAL=1
 RESULTS_DIR="${RESULTS_DIR:-"$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/results"}"
 
@@ -54,10 +64,18 @@ Options:
   --label TEXT         Descriptive label used as the flamegraph title (with --profile),
                        e.g. "Node WebTransport (fails-components)". Falls back to a
                        generic title if omitted.
+  --bench-profile NAME Self-describing profile tag (ideal|high_latency|packet_loss|
+                       crossover|profiling|smoke). Embedded in metrics.csv + metadata.json.
+  --runtime NAME       Runtime under test (node|deno|bun). Embedded as a data dimension.
+  --variant NAME       Full protocol variant (e.g. webtransport-fails-components).
+  --sweep-stamp STAMP  Shared UTC stamp from the calling sweep, used as the run-dir name
+                       PREFIX so all dirs from one command group together. Falls back to
+                       this run's own start stamp when omitted (standalone runs).
   -h, --help           Show this message.
 
 Environment exported to children:
-  SERVER_IP, CLIENT_IP, SERVER_PORT
+  SERVER_IP, CLIENT_IP, SERVER_PORT, and (for the client) the self-describing
+  RUN_PROFILE, RUN_RUNTIME, RUN_VARIANT, RUN_LOSS_PCT, RUN_DELAY_MS.
 EOF
     exit "${1:-0}"
 }
@@ -75,6 +93,10 @@ while [[ $# -gt 0 ]]; do
         --client-cores)  CLIENT_CORES="$2";  shift 2 ;;
         --profile)       PROFILE=1;          shift 1 ;;
         --label)         LABEL="$2";         shift 2 ;;
+        --bench-profile) BENCH_PROFILE="$2"; shift 2 ;;
+        --runtime)       RUNTIME="$2";       shift 2 ;;
+        --variant)       VARIANT="$2";       shift 2 ;;
+        --sweep-stamp)   SWEEP_STAMP="$2";   shift 2 ;;
         -h|--help)       usage 0 ;;
         *)               echo "Unknown argument: $1" >&2; usage 1 ;;
     esac
@@ -84,14 +106,86 @@ done
 [[ $EUID -eq 0 ]] || { echo "Must be run as root." >&2; exit 1; }
 
 mkdir -p "$RESULTS_DIR"
-RUN_TAG="$(date +%Y%m%d_%H%M%S)_loss${LOSS//%/p}_delay${DELAY}"
+
+# --- Self-describing dimensions (numeric loss/delay derived from tc args) -----
+LOSS_PCT="${LOSS%\%}"      # "1%"  -> "1"
+DELAY_MS="${DELAY%ms}"     # "20ms" -> "20"
+# Dir-name + metadata fallbacks so standalone runs never break.
+TAG_PROFILE="${BENCH_PROFILE:-standalone}"
+TAG_RUNTIME="${RUNTIME:-unknown}"
+TAG_VARIANT="${VARIANT:-unknown}"
+# Best-effort extraction of protocol + concurrency from the client command,
+# purely for the metadata.json record (the harness is otherwise protocol-blind).
+RUN_PROTOCOL=""
+RUN_CONCURRENCY=""
+[[ "$CLIENT_CMD" =~ --protocol[[:space:]]+([a-z-]+) ]] && RUN_PROTOCOL="${BASH_REMATCH[1]}"
+[[ "$CLIENT_CMD" =~ --clients[[:space:]]+([0-9]+) ]]   && RUN_CONCURRENCY="${BASH_REMATCH[1]}"
+
+# Descriptive, self-identifying run-dir name. The timestamp is a PREFIX so dirs
+# from one sweep command (which all share --sweep-stamp) group together and sort
+# adjacently. Standalone runs fall back to this run's own UTC start stamp.
+# "__" field separator (variants use single "-"); __r<n> on collision.
+RUN_STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+PREFIX_STAMP="${SWEEP_STAMP:-$RUN_STAMP}"
+RUN_TAG="${PREFIX_STAMP}__${TAG_PROFILE}__${TAG_RUNTIME}__${TAG_VARIANT}__loss${LOSS_PCT}pct__delay${DELAY_MS}ms"
 RUN_DIR="$RESULTS_DIR/$RUN_TAG"
+_n=0
+while [[ -e "$RUN_DIR" ]]; do
+    _n=$(( _n + 1 ))
+    RUN_DIR="$RESULTS_DIR/${RUN_TAG}__r${_n}"
+done
+RUN_TAG="$(basename "$RUN_DIR")"
 mkdir -p "$RUN_DIR"
 
 SERVER_PID=""
 CLIENT_PID=""
 PIDSTAT_PID=""
 CLIENT_PIDSTAT_PID=""
+CLIENT_RC=""
+
+# --- metadata.json writer -----------------------------------------------------
+# Self-describing dimension+path index for each run (replaces the old
+# annotations.csv + chronological-zip linkage). Written by the cleanup trap so
+# it always exists — even when a run fails before producing a metrics row.
+# Plain printf JSON (no jq dependency); none of the embedded values contain
+# double quotes, so no escaping is required.
+write_metadata() {
+    local profiled_json="false" perf_json="null" flame_json="null"
+    [[ "$PROFILE" -eq 1 ]] && profiled_json="true"
+    [[ -f "$RUN_DIR/perf.data"      ]] && perf_json="\"perf.data\""
+    [[ -f "$RUN_DIR/flamegraph.svg" ]] && flame_json="\"flamegraph.svg\""
+    local rc_json="null"
+    [[ -n "$CLIENT_RC" ]] && rc_json="$CLIENT_RC"
+    printf '%s\n' "{
+  \"schema_version\": 1,
+  \"run_tag\": \"${RUN_TAG}\",
+  \"timestamp_start\": \"${RUN_STAMP}\",
+  \"sweep_stamp\": \"${SWEEP_STAMP}\",
+  \"profile\": \"${TAG_PROFILE}\",
+  \"runtime\": \"${TAG_RUNTIME}\",
+  \"protocol\": \"${RUN_PROTOCOL}\",
+  \"protocol_variant\": \"${TAG_VARIANT}\",
+  \"packet_loss_pct\": ${LOSS_PCT:-0},
+  \"delay_ms\": ${DELAY_MS:-0},
+  \"duration_sec\": ${DURATION},
+  \"concurrency\": ${RUN_CONCURRENCY:-0},
+  \"server_port\": ${SERVER_PORT},
+  \"server_cmd\": \"${SERVER_CMD}\",
+  \"server_cores\": \"${SERVER_CORES}\",
+  \"client_cores\": \"${CLIENT_CORES}\",
+  \"profiled\": ${profiled_json},
+  \"client_rc\": ${rc_json},
+  \"files\": {
+    \"server_log\": \"server.log\",
+    \"client_log\": \"client.log\",
+    \"server_pidstat\": \"server_pidstat.log\",
+    \"client_pidstat\": \"client_pidstat.log\",
+    \"rtts\": \"rtts.csv\",
+    \"perf_data\": ${perf_json},
+    \"flamegraph\": ${flame_json}
+  }
+}" > "$RUN_DIR/metadata.json"
+}
 
 cleanup() {
     local ec=$?
@@ -129,6 +223,10 @@ cleanup() {
             rm -f "$RUN_DIR/flamegraph.svg"
         fi
     fi
+
+    # Write the self-describing run record last, so perf.data/flamegraph.svg
+    # presence and CLIENT_RC are final. Always runs (even on early failure).
+    [[ -d "${RUN_DIR:-}" ]] && write_metadata
 
     ip netns del "$NS_SERVER" 2>/dev/null
     ip netns del "$NS_CLIENT" 2>/dev/null
@@ -186,7 +284,7 @@ fi
 export SERVER_IP CLIENT_IP SERVER_PORT
 SERVER_LOG="$RUN_DIR/server.log"
 CLIENT_LOG="$RUN_DIR/client.log"
-PIDSTAT_LOG="$RUN_DIR/pidstat.log"
+PIDSTAT_LOG="$RUN_DIR/server_pidstat.log"
 
 # When profiling, wrap the server in perf record. perf must sit *inside* the
 # netns exec / taskset so it profiles the actual server subtree (and inherits
@@ -230,11 +328,15 @@ if [[ -n "$CLIENT_CORES" ]]; then
     taskset -c "$CLIENT_CORES" ip netns exec "$NS_CLIENT" env \
         SERVER_IP="$SERVER_IP" CLIENT_IP="$CLIENT_IP" SERVER_PORT="$SERVER_PORT" \
         DURATION="$DURATION" RESULTS_DIR="$RUN_DIR" \
+        RUN_PROFILE="$BENCH_PROFILE" RUN_RUNTIME="$RUNTIME" RUN_VARIANT="$VARIANT" \
+        RUN_LOSS_PCT="$LOSS_PCT" RUN_DELAY_MS="$DELAY_MS" \
         bash -c "$CLIENT_CMD" >"$CLIENT_LOG" 2>&1 &
 else
     ip netns exec "$NS_CLIENT" env \
         SERVER_IP="$SERVER_IP" CLIENT_IP="$CLIENT_IP" SERVER_PORT="$SERVER_PORT" \
         DURATION="$DURATION" RESULTS_DIR="$RUN_DIR" \
+        RUN_PROFILE="$BENCH_PROFILE" RUN_RUNTIME="$RUNTIME" RUN_VARIANT="$VARIANT" \
+        RUN_LOSS_PCT="$LOSS_PCT" RUN_DELAY_MS="$DELAY_MS" \
         bash -c "$CLIENT_CMD" >"$CLIENT_LOG" 2>&1 &
 fi
 CLIENT_PID=$!

@@ -2,8 +2,14 @@
 """
 generate_charts.py — Produce thesis charts from benchmark sweep results.
 
-Reads per-profile metrics.csv + annotations.csv from results/{ideal,high_latency,packet_loss}/
-and individual run directories for raw RTT and CPU data.
+Reads the self-describing per-profile metrics.csv from
+results/{ideal,high_latency,packet_loss,crossover}/ (each row carries its own
+Profile/Runtime/ProtocolVariant/PacketLossPct/DelayMs — no annotations.csv) and
+maps runs to their raw RTT/CPU data via each run dir's metadata.json.
+
+Every chartN_<name>.png is written alongside a chartN_<name>.csv containing
+exactly the data plotted, with descriptive column names, so the raw numbers
+behind each figure can be analysed directly.
 
 Charts produced in results/charts/:
   chart1_throughput_by_protocol.png  — Throughput by protocol/runtime (ideal, log scale)
@@ -20,6 +26,7 @@ Usage:
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -51,6 +58,10 @@ PROTO_LABELS: dict[str, str] = {
 }
 RUNTIME_LABELS: dict[str, str] = {"node": "Node", "deno": "Deno", "bun": "Bun"}
 
+# Canonical runtime display order for EVERY chart (bars, lines, and legends),
+# applied within each protocol grouping.
+RUNTIME_ORDER = ["Bun", "Deno", "Node"]
+
 # Desired X-axis order for chart 1
 PROTO_ORDER = [
     "WebSocket",
@@ -66,28 +77,39 @@ PROTO_ORDER = [
 
 
 def load_all() -> pd.DataFrame:
-    """Load and merge metrics + annotations for all available profiles."""
+    """Load the self-describing metrics.csv from each profile (no annotations)."""
     frames: list[pd.DataFrame] = []
     for profile in PROFILES:
         metrics_path = RESULTS_BASE / profile / "metrics.csv"
-        annotations_path = RESULTS_BASE / profile / "annotations.csv"
         if not metrics_path.exists():
             print(f"  [warn] missing {metrics_path} — skipping profile '{profile}'")
             continue
-        if not annotations_path.exists():
-            print(f"  [warn] missing {annotations_path} — skipping profile '{profile}'")
-            continue
         df = pd.read_csv(metrics_path)
-        ann = pd.read_csv(annotations_path)
-        merged = df.merge(ann, on="Timestamp", how="left")
-        merged["Profile"] = profile
-        frames.append(merged)
+        # Profile is embedded per-row; fall back to the dir name if absent.
+        if "Profile" not in df.columns:
+            df["Profile"] = profile
+        frames.append(df)
 
     if not frames:
-        print("No benchmark data found. Run orchestration/run_benchmark.sh first.")
+        print("No benchmark data found. Run orchestration/sweep_benchmark.sh first.")
         sys.exit(1)
 
     result = pd.concat(frames, ignore_index=True)
+
+    # Latest-run-wins: if results/ holds repeated runs of the same combination
+    # (a sweep re-run without clearing), keep only the most recent row per combo
+    # so the metrics-based charts agree with the raw CDF/CPU charts (which use
+    # build_run_dir_map's latest-by-timestamp_start dir).
+    if "Timestamp" in result.columns:
+        dedup_keys = [k for k in
+                      ["Profile", "Runtime", "ProtocolVariant", "PacketLossPct", "DelayMs"]
+                      if k in result.columns]
+        result = (
+            result.sort_values("Timestamp")
+            .drop_duplicates(subset=dedup_keys, keep="last")
+            .reset_index(drop=True)
+        )
+
     result["RuntimeLabel"] = result["Runtime"].map(RUNTIME_LABELS)
     result["ProtoLabel"] = result["ProtocolVariant"].map(PROTO_LABELS)
     return result
@@ -95,29 +117,38 @@ def load_all() -> pd.DataFrame:
 
 def build_run_dir_map(profile: str) -> dict[tuple[str, str], Path]:
     """
-    Return a dict mapping (runtime, protocol_variant) -> run directory Path.
-
-    Run directories and annotation rows are both in chronological order;
-    zipping them 1:1 gives the correct mapping.
+    Map (runtime, protocol_variant) -> run directory, read explicitly from each
+    run's metadata.json. Order-independent — no chronological zip. On duplicate
+    keys (re-runs) keep the latest by timestamp_start; skip failed runs
+    (client_rc != 0).
     """
     profile_dir = RESULTS_BASE / profile
     if not profile_dir.exists():
         return {}
 
-    run_dirs = sorted(
-        p for p in profile_dir.iterdir()
-        if p.is_dir() and not p.name.startswith(".")
-    )
-    ann_path = profile_dir / "annotations.csv"
-    if not ann_path.exists():
-        return {}
+    chosen: dict[tuple[str, str], tuple[str, Path]] = {}
+    for meta_path in profile_dir.glob("*/metadata.json"):
+        try:
+            meta = json.loads(meta_path.read_text())
+        except (json.JSONDecodeError, OSError):
+            continue
+        rc = meta.get("client_rc")
+        if rc is not None and rc != 0:
+            continue
+        key = (meta.get("runtime"), meta.get("protocol_variant"))
+        ts = str(meta.get("timestamp_start", ""))
+        prev = chosen.get(key)
+        if prev is None or ts > prev[0]:
+            chosen[key] = (ts, meta_path.parent)
+    return {k: v[1] for k, v in chosen.items()}
 
-    ann = pd.read_csv(ann_path).sort_values("Timestamp").reset_index(drop=True)
-    result: dict[tuple[str, str], Path] = {}
-    for i, row in ann.iterrows():
-        if i < len(run_dirs):
-            result[(row["Runtime"], row["ProtocolVariant"])] = run_dirs[i]
-    return result
+
+def write_chart_csv(data, out_dir: Path, stem: str) -> None:
+    """Write the exact data a chart plots to out_dir/<stem>.csv (LLM-readable)."""
+    df = data if isinstance(data, pd.DataFrame) else pd.DataFrame(data)
+    path = out_dir / f"{stem}.csv"
+    df.to_csv(path, index=False)
+    print(f"  wrote {path}")
 
 
 # ---------------------------------------------------------------------------
@@ -127,7 +158,7 @@ def build_run_dir_map(profile: str) -> dict[tuple[str, str], Path]:
 
 def parse_pidstat(path: Path) -> list[float]:
     """
-    Parse %CPU values from a pidstat.log file.
+    Parse %CPU values from a pidstat log file (server_pidstat.log / client_pidstat.log).
 
     Format (repeating):
         Linux banner line
@@ -171,7 +202,7 @@ def chart_throughput_by_protocol(df: pd.DataFrame, out_dir: Path) -> None:
     present_protos = set(ideal["ProtoLabel"].unique())
     x_order = [p for p in PROTO_ORDER if p in present_protos]
 
-    runtime_order = ["Node", "Deno", "Bun"]
+    runtime_order = RUNTIME_ORDER
 
     fig, ax = plt.subplots(figsize=(15, 7))
     sns.barplot(
@@ -197,6 +228,13 @@ def chart_throughput_by_protocol(df: pd.DataFrame, out_dir: Path) -> None:
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
     print(f"  wrote {out_path}")
+
+    csv_df = (
+        ideal[["RuntimeLabel", "ProtocolVariant", "Protocol", "Throughput"]]
+        .rename(columns={"RuntimeLabel": "Runtime", "Throughput": "Throughput_msg_s"})
+        .sort_values(["Runtime", "ProtocolVariant"])
+    )
+    write_chart_csv(csv_df, out_dir, "chart1_throughput_by_protocol")
 
 
 # ---------------------------------------------------------------------------
@@ -228,7 +266,7 @@ def chart_connect_time(df: pd.DataFrame, out_dir: Path) -> None:
     present_protos = set(ideal["ProtoLabel"].unique())
     x_order = [p for p in PROTO_ORDER if p in present_protos]
 
-    runtime_order = ["Node", "Deno", "Bun"]
+    runtime_order = RUNTIME_ORDER
 
     fig, ax = plt.subplots(figsize=(15, 7))
     sns.barplot(
@@ -256,6 +294,13 @@ def chart_connect_time(df: pd.DataFrame, out_dir: Path) -> None:
     plt.close(fig)
     print(f"  wrote {out_path}")
 
+    csv_df = (
+        ideal[["RuntimeLabel", "ProtocolVariant", "MeanConnect_ms"]]
+        .rename(columns={"RuntimeLabel": "Runtime"})
+        .sort_values(["Runtime", "ProtocolVariant"])
+    )
+    write_chart_csv(csv_df, out_dir, "chart5_connect_time")
+
 
 # ---------------------------------------------------------------------------
 # Chart 6 — CPU Efficiency (ideal): throughput per 1% server CPU
@@ -272,7 +317,7 @@ def chart_cpu_efficiency(df: pd.DataFrame, out_dir: Path) -> None:
 
     ideal = ideal[ideal["ProtoLabel"].notna()].copy()
 
-    # Map each ideal run to its run directory so we can read its pidstat.log.
+    # Map each ideal run to its run directory so we can read its server_pidstat.log.
     run_map = build_run_dir_map("ideal")
     if not run_map:
         print("  [warn] no ideal run dirs found — skipping chart 6")
@@ -286,7 +331,7 @@ def chart_cpu_efficiency(df: pd.DataFrame, out_dir: Path) -> None:
             print(f"  [warn] chart 6: no run dir for {key} — skipping")
             continue
 
-        pidstat_path = run_dir / "pidstat.log"
+        pidstat_path = run_dir / "server_pidstat.log"
         if not pidstat_path.exists():
             print(f"  [warn] chart 6: {pidstat_path} not found — skipping {key}")
             continue
@@ -306,6 +351,9 @@ def chart_cpu_efficiency(df: pd.DataFrame, out_dir: Path) -> None:
         records.append({
             "RuntimeLabel": row["RuntimeLabel"],
             "ProtoLabel": row["ProtoLabel"],
+            "ProtocolVariant": row["ProtocolVariant"],
+            "Throughput": row["Throughput"],
+            "AvgServerCPUPct": avg_cpu,
             "Efficiency": row["Throughput"] / avg_cpu,
         })
 
@@ -317,7 +365,7 @@ def chart_cpu_efficiency(df: pd.DataFrame, out_dir: Path) -> None:
 
     present_protos = set(eff["ProtoLabel"].unique())
     x_order = [p for p in PROTO_ORDER if p in present_protos]
-    runtime_order = ["Node", "Deno", "Bun"]
+    runtime_order = RUNTIME_ORDER
 
     fig, ax = plt.subplots(figsize=(15, 7))
     sns.barplot(
@@ -344,6 +392,17 @@ def chart_cpu_efficiency(df: pd.DataFrame, out_dir: Path) -> None:
     plt.close(fig)
     print(f"  wrote {out_path}")
 
+    csv_df = (
+        eff[["RuntimeLabel", "ProtocolVariant", "Throughput", "AvgServerCPUPct", "Efficiency"]]
+        .rename(columns={
+            "RuntimeLabel": "Runtime",
+            "Throughput": "Throughput_msg_s",
+            "Efficiency": "Efficiency_msg_s_per_pct",
+        })
+        .sort_values(["Runtime", "ProtocolVariant"])
+    )
+    write_chart_csv(csv_df, out_dir, "chart6_cpu_efficiency")
+
 
 # ---------------------------------------------------------------------------
 # Chart 7 — Crossover: throughput vs packet loss at fixed 50ms latency
@@ -353,17 +412,17 @@ def chart_cpu_efficiency(df: pd.DataFrame, out_dir: Path) -> None:
 def chart_crossover(df: pd.DataFrame, out_dir: Path) -> None:
     cross = df[df["Profile"] == "crossover"].copy()
     if cross.empty:
-        print("  [warn] no crossover data — skipping chart 7 (run orchestration/run_crossover.sh)")
+        print("  [warn] no crossover data — skipping chart 7 (run orchestration/sweep_crossover.sh)")
         return
 
-    # PacketLoss arrives from the crossover annotations.csv 4th column.
-    if "PacketLoss" not in cross.columns:
-        print("  [warn] crossover data has no PacketLoss column — skipping chart 7")
+    # PacketLossPct is an embedded, self-describing metrics column.
+    if "PacketLossPct" not in cross.columns:
+        print("  [warn] crossover data has no PacketLossPct column — skipping chart 7")
         return
 
     cross = cross[cross["ProtoLabel"].notna()].copy()
-    cross["PacketLoss"] = pd.to_numeric(cross["PacketLoss"], errors="coerce")
-    cross = cross[cross["PacketLoss"].notna()].copy()
+    cross["PacketLossPct"] = pd.to_numeric(cross["PacketLossPct"], errors="coerce")
+    cross = cross[cross["PacketLossPct"].notna()].copy()
 
     # The crossover thesis is strictly WebSocket (TCP) vs WebTransport (QUIC);
     # the polling/SSE protocols only clutter the chart and bury the comparison.
@@ -376,23 +435,33 @@ def chart_crossover(df: pd.DataFrame, out_dir: Path) -> None:
     # was sampled more than once.
     cross["Series"] = cross["RuntimeLabel"] + " " + cross["ProtoLabel"]
     grouped = (
-        cross.groupby(["Series", "RuntimeLabel", "ProtoLabel", "PacketLoss"])["Throughput"]
+        cross.groupby(["Series", "RuntimeLabel", "ProtoLabel", "PacketLossPct"])["Throughput"]
         .mean()
         .reset_index()
     )
 
     fig, ax = plt.subplots(figsize=(13, 8))
 
+    # Explicit draw/legend order: protocol-major, runtime-minor (Bun, Deno, Node).
+    present_series = set(grouped["Series"])
+    proto_classes = [p for p in ["WebSocket", "WebTransport"] if p in set(grouped["ProtoLabel"])]
+    series_order = [
+        f"{rt} {proto}"
+        for proto in proto_classes
+        for rt in RUNTIME_ORDER
+        if f"{rt} {proto}" in present_series
+    ]
+
     # WebSocket lines dashed (the TCP baseline that should collapse);
     # WebTransport lines solid + thicker (the QUIC contender that should hold up).
-    for series, g in grouped.groupby("Series"):
-        g = g.sort_values("PacketLoss")
+    for series in series_order:
+        g = grouped[grouped["Series"] == series].sort_values("PacketLossPct")
         runtime = g["RuntimeLabel"].iloc[0]
         proto = g["ProtoLabel"].iloc[0]
         color = RUNTIME_PALETTE.get(runtime, "#888888")
         is_wt = proto == "WebTransport"
         ax.plot(
-            g["PacketLoss"],
+            g["PacketLossPct"],
             g["Throughput"],
             label=series,
             color=color,
@@ -410,7 +479,7 @@ def chart_crossover(df: pd.DataFrame, out_dir: Path) -> None:
     ax.yaxis.set_major_formatter(ticker.FuncFormatter(lambda x, _: f"{x:,.0f}"))
     ax.set_ylim(bottom=0)
     # Pin ticks to the swept loss levels actually present.
-    loss_ticks = sorted(grouped["PacketLoss"].unique())
+    loss_ticks = sorted(grouped["PacketLossPct"].unique())
     ax.set_xticks(loss_ticks)
     ax.set_xticklabels([f"{int(v) if v == int(v) else v}%" for v in loss_ticks])
     ax.set_title(
@@ -427,6 +496,17 @@ def chart_crossover(df: pd.DataFrame, out_dir: Path) -> None:
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
     print(f"  wrote {out_path}")
+
+    csv_df = (
+        grouped[["RuntimeLabel", "ProtoLabel", "PacketLossPct", "Throughput"]]
+        .rename(columns={
+            "RuntimeLabel": "Runtime",
+            "ProtoLabel": "Protocol",
+            "Throughput": "Throughput_msg_s",
+        })
+        .sort_values(["Runtime", "Protocol", "PacketLossPct"])
+    )
+    write_chart_csv(csv_df, out_dir, "chart7_crossover")
 
 
 # ---------------------------------------------------------------------------
@@ -451,9 +531,15 @@ def chart_packet_loss_resilience(df: pd.DataFrame, out_dir: Path) -> None:
     subset["ProfileLabel"] = subset["Profile"].map(profile_label_map)
     subset["GroupLabel"] = subset["RuntimeLabel"] + "\n" + subset["ProtoLabel"].str.replace("\n", " ")
 
-    # Determine a stable x-axis order (ideal throughput descending)
-    order_df = subset[subset["Profile"] == "ideal"].groupby("GroupLabel")["Throughput"].mean()
-    x_order = order_df.sort_values(ascending=False).index.tolist()
+    # Stable x-axis order: protocol-major (PROTO_ORDER), runtime-minor
+    # (RUNTIME_ORDER = Bun, Deno, Node) — so each protocol group reads Bun→Deno→Node.
+    present_groups = set(subset["GroupLabel"])
+    x_order = [
+        f"{rt}\n{proto}"
+        for proto in PROTO_ORDER
+        for rt in RUNTIME_ORDER
+        if f"{rt}\n{proto}" in present_groups
+    ]
 
     profile_order = [profile_label_map[p] for p in ["ideal", "packet_loss"] if p in subset["Profile"].values]
 
@@ -485,6 +571,13 @@ def chart_packet_loss_resilience(df: pd.DataFrame, out_dir: Path) -> None:
     plt.close(fig)
     print(f"  wrote {out_path}")
 
+    csv_df = (
+        subset[["RuntimeLabel", "ProtocolVariant", "Profile", "Throughput"]]
+        .rename(columns={"RuntimeLabel": "Runtime", "Throughput": "Throughput_msg_s"})
+        .sort_values(["Runtime", "ProtocolVariant", "Profile"])
+    )
+    write_chart_csv(csv_df, out_dir, "chart2_packet_loss_resilience")
+
 
 # ---------------------------------------------------------------------------
 # Chart 3 — Latency CDF
@@ -496,13 +589,14 @@ def chart_packet_loss_resilience(df: pd.DataFrame, out_dir: Path) -> None:
 #   WebTransport FC  — solid  (-),   alpha=1.0, lw=2.4   (primary comparison)
 #   WT vmeansdev     — dash-dot (-.), alpha=1.0, lw=2.4   (distinct Bun WT variant)
 CDF_RUNS = [
+    # Ordered Bun, Deno, Node within each protocol class (WS then WebTransport).
     # runtime                 variant                         label                              color      ls     lw    alpha
-    ("node", "ws",                            "Node WS (baseline)",              "#339933", "--",  1.8,  0.6),
-    ("deno", "ws",                            "Deno WS (baseline)",              "#1A1A1A", "--",  1.8,  0.6),
     ("bun",  "ws",                            "Bun WS (baseline)",               "#F472B6", "--",  1.8,  0.6),
+    ("deno", "ws",                            "Deno WS (baseline)",              "#1A1A1A", "--",  1.8,  0.6),
+    ("node", "ws",                            "Node WS (baseline)",              "#339933", "--",  1.8,  0.6),
+    ("bun",  "webtransport-vmeansdev",        "Bun WebTransport (vmeansdev)",     "#F472B6", "-",   2.4,  1.0),
     ("deno", "webtransport",                  "Deno WebTransport (native)",       "#1A1A1A", "-",   2.4,  1.0),
     ("node", "webtransport-fails-components", "Node WebTransport (fails-components)",           "#339933", "-",   2.4,  1.0),
-    ("bun",  "webtransport-vmeansdev",        "Bun WebTransport (vmeansdev)",     "#F472B6", "-",   2.4,  1.0),
 ]
 
 _RNG = np.random.default_rng(42)
@@ -532,6 +626,7 @@ def chart_latency_cdf(out_dir: Path) -> None:
 
     fig, ax = plt.subplots(figsize=(12, 7))
     plotted = False
+    cdf_records: list[dict] = []
 
     for runtime, variant, label, color, ls, lw, alpha in CDF_RUNS:
         run_dir = run_map.get((runtime, variant))
@@ -556,6 +651,17 @@ def chart_latency_cdf(out_dir: Path) -> None:
 
         ax.plot(x, y, label=label, color=color, linestyle=ls, linewidth=lw, alpha=alpha)
         plotted = True
+
+        # Companion CSV: downsample the plotted curve to <=300 evenly-spaced
+        # points so the data file matches the picture without being huge.
+        if len(x) > 0:
+            idx = np.unique(np.linspace(0, len(x) - 1, min(len(x), 300)).astype(int))
+            for xi, yi in zip(x[idx], y[idx]):
+                cdf_records.append({
+                    "Series": label,
+                    "RTT_ms": round(float(xi), 4),
+                    "CumulativeProbability": round(float(yi), 5),
+                })
 
     if not plotted:
         print("  [warn] chart 3: no data plotted — skipping")
@@ -584,6 +690,9 @@ def chart_latency_cdf(out_dir: Path) -> None:
     plt.close(fig)
     print(f"  wrote {out_path}")
 
+    if cdf_records:
+        write_chart_csv(cdf_records, out_dir, "chart3_latency_cdf")
+
 
 # ---------------------------------------------------------------------------
 # Chart 4 — Server CPU Over Time
@@ -592,12 +701,13 @@ def chart_latency_cdf(out_dir: Path) -> None:
 # Each entry: (runtime, variant, label, color, linestyle, linewidth, alpha)
 # Mirrors CDF chart styling: WebSocket = dashed/low-opacity, WT FC = solid, WT vmeansdev = dash-dot
 CPU_RUNS = [
-    ("node", "ws",                            "Node WS (baseline)",              "#339933", "--", 1.5, 0.6),
-    ("deno", "ws",                            "Deno WS (baseline)",              "#1A1A1A", "--", 1.5, 0.6),
+    # Ordered Bun, Deno, Node within each protocol class (WS then WebTransport).
     ("bun",  "ws",                            "Bun WS (baseline)",               "#F472B6", "--", 1.5, 0.6),
+    ("deno", "ws",                            "Deno WS (baseline)",              "#1A1A1A", "--", 1.5, 0.6),
+    ("node", "ws",                            "Node WS (baseline)",              "#339933", "--", 1.5, 0.6),
+    ("bun",  "webtransport-vmeansdev",        "Bun WebTransport (vmeansdev)",     "#F472B6", "-",  2.0, 1.0),
     ("deno", "webtransport",                  "Deno WebTransport (native)",       "#1A1A1A", "-",  2.0, 1.0),
     ("node", "webtransport-fails-components", "Node WebTransport (fails-components)",           "#339933", "-",  2.0, 1.0),
-    ("bun",  "webtransport-vmeansdev",        "Bun WebTransport (vmeansdev)",     "#F472B6", "-",  2.0, 1.0),
 ]
 
 
@@ -609,13 +719,14 @@ def chart_cpu_over_time(out_dir: Path) -> None:
 
     fig, ax = plt.subplots(figsize=(11, 6))
     plotted = False
+    cpu_records: list[dict] = []
 
     for runtime, variant, label, color, ls, lw, alpha in CPU_RUNS:
         run_dir = run_map.get((runtime, variant))
         if run_dir is None:
             print(f"  [warn] chart 4: no run dir for ({runtime}, {variant}) — skipping line")
             continue
-        pidstat_path = run_dir / "pidstat.log"
+        pidstat_path = run_dir / "server_pidstat.log"
         if not pidstat_path.exists():
             print(f"  [warn] chart 4: {pidstat_path} not found — skipping line")
             continue
@@ -628,6 +739,9 @@ def chart_cpu_over_time(out_dir: Path) -> None:
         elapsed = list(range(len(cpu_vals)))
         ax.plot(elapsed, cpu_vals, label=label, color=color, linestyle=ls, linewidth=lw, alpha=alpha)
         plotted = True
+
+        for sec, cpu in zip(elapsed, cpu_vals):
+            cpu_records.append({"Series": label, "ElapsedSec": sec, "ServerCPUPct": cpu})
 
     if not plotted:
         print("  [warn] chart 4: no data plotted — skipping")
@@ -649,6 +763,9 @@ def chart_cpu_over_time(out_dir: Path) -> None:
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
     print(f"  wrote {out_path}")
+
+    if cpu_records:
+        write_chart_csv(cpu_records, out_dir, "chart4_cpu_over_time")
 
 
 # ---------------------------------------------------------------------------

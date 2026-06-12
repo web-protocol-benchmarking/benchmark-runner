@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 #
-# smoke_test.sh — End-to-end pipeline validation across the full runtime x
-# protocol matrix (15 runtime+protocol combinations).
+# sweep_smoke.sh — End-to-end pipeline validation across the full runtime x
+# protocol matrix (15 runtime+protocol combinations). Driver: calls the core
+# harness (harness_run_test.sh) once per combination.
 #
-# Each combination drives a 2-second / 2-client echo run through run_test.sh
+# Each combination drives a 2-second / 2-client echo run through harness_run_test.sh
 # with no network impairment, then asserts that the resulting metrics.csv
 # row and per-run rtts.csv are well-formed and impairment-free. Any single
 # failure aborts the matrix with a non-zero exit so we never advance to
-# sweep automation on a broken pipeline.
+# sweep automation on a broken pipeline. Output is contained in results/smoke/.
 #
 # Run as root.
 
@@ -16,10 +17,16 @@ set -euo pipefail
 # --- Paths --------------------------------------------------------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/common.sh"
-RUN_TEST="$SCRIPT_DIR/run_test.sh"
+RUN_TEST="$SCRIPT_DIR/harness_run_test.sh"
 CLIENT_SCRIPT="$REPO_ROOT/client/load_generator.ts"
-RESULTS_DIR="$REPO_ROOT/results"
+# Contain smoke output in results/smoke/ so it never pollutes results/ root.
+RESULTS_DIR="$REPO_ROOT/results/smoke"
 METRICS_CSV="$RESULTS_DIR/metrics.csv"
+
+# Map a metrics-header column name to its 1-based index. Lets the assertions
+# below reference columns by NAME instead of brittle fixed positions (the
+# self-describing schema reorders columns vs the old layout).
+col_idx() { echo "$1" | tr ',' '\n' | grep -nxF "$2" | head -n1 | cut -d: -f1; }
 
 # --- Matrix parameters --------------------------------------------------------
 # The matrix is asymmetric — not every runtime has the same WebTransport variants.
@@ -35,8 +42,13 @@ MIN_RTT_SAMPLES=10
 SERVER_CORES="0"      # pin server to core 0
 CLIENT_CORES="1,2"    # pin client to cores 1-2 (2 cores for 2 concurrent clients)
 
+# One UTC stamp for the whole sweep — passed to every run as its dir-name prefix
+# so all dirs from this invocation group together.
+SWEEP_STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+
 # --- Pre-flight ---------------------------------------------------------------
 run_preflight
+mkdir -p "$RESULTS_DIR"
 
 # --- Resolve the per-combination launch command -------------------------------
 run_one() {
@@ -67,7 +79,7 @@ run_one() {
         --duration \$DURATION \
         --clients $CLIENTS"
 
-    if ! SERVER_PORT="$port" "$RUN_TEST" \
+    if ! RESULTS_DIR="$RESULTS_DIR" SERVER_PORT="$port" "$RUN_TEST" \
             --server "$server_cmd" \
             --client "$client_cmd" \
             --duration "$DURATION" \
@@ -75,8 +87,12 @@ run_one() {
             --delay "0ms" \
             --port "$port" \
             --server-cores "$SERVER_CORES" \
-            --client-cores "$CLIENT_CORES"; then
-        fail "${tag}: run_test.sh exited non-zero"
+            --client-cores "$CLIENT_CORES" \
+            --bench-profile smoke \
+            --runtime "$runtime" \
+            --variant "$proto" \
+            --sweep-stamp "$SWEEP_STAMP"; then
+        fail "${tag}: harness_run_test.sh exited non-zero"
     fi
 
     # Locate newest per-run directory under results/.
@@ -91,7 +107,7 @@ run_one() {
 
     local header expected_header current_lines new_rows
     header=$(head -n1 "$METRICS_CSV")
-    expected_header="Timestamp,Protocol,Concurrency,DurationSec,Throughput,p50_ms,p95_ms,p99_ms,Errors,Overflows,MeanConnect_ms"
+    expected_header="Timestamp,Profile,Runtime,ProtocolVariant,Protocol,Concurrency,DurationSec,PacketLossPct,DelayMs,Throughput,p50_ms,p95_ms,p99_ms,Errors,Overflows,MeanConnect_ms"
     [[ "$header" == "$expected_header" ]] \
         || fail "${tag}: metrics.csv header mismatch. got: $header"
 
@@ -105,14 +121,22 @@ run_one() {
             || fail "${tag}: expected exactly 1 new row in metrics.csv, got $new_rows"
     fi
 
-    local last_row protocol_col expected_proto
+    # Reference columns by NAME (the self-describing schema reorders columns).
+    local last_row protocol_col profile_col runtime_col variant_col expected_proto
     last_row=$(tail -n1 "$METRICS_CSV")
-    protocol_col=$(echo "$last_row" | cut -d',' -f2)
-    # Variant names (webtransport-*) all write "webtransport" to metrics.csv.
+    protocol_col=$(echo "$last_row" | cut -d',' -f"$(col_idx "$header" Protocol)")
+    profile_col=$(echo "$last_row"  | cut -d',' -f"$(col_idx "$header" Profile)")
+    runtime_col=$(echo "$last_row"  | cut -d',' -f"$(col_idx "$header" Runtime)")
+    variant_col=$(echo "$last_row"  | cut -d',' -f"$(col_idx "$header" ProtocolVariant)")
+    # Variant names (webtransport-*) all write "webtransport" to the Protocol col.
     expected_proto="$proto"
     [[ "$proto" == webtransport* ]] && expected_proto="webtransport"
     [[ "$protocol_col" == "$expected_proto" ]] \
-        || fail "${tag}: metrics.csv row protocol=$protocol_col, expected $expected_proto"
+        || fail "${tag}: metrics.csv Protocol=$protocol_col, expected $expected_proto"
+    # The self-describing dimensions must be embedded correctly (no annotations).
+    [[ "$profile_col" == "smoke"     ]] || fail "${tag}: Profile=$profile_col, expected smoke"
+    [[ "$runtime_col" == "$runtime"  ]] || fail "${tag}: Runtime=$runtime_col, expected $runtime"
+    [[ "$variant_col" == "$proto"    ]] || fail "${tag}: ProtocolVariant=$variant_col, expected $proto"
 
     # ---- Assertion: rtts.csv exists with header + > MIN samples -------------
     local raw_rtts raw_header raw_samples
@@ -129,17 +153,17 @@ run_one() {
 
     # ---- Assertion: errors == 0 and overflows == 0 --------------------------
     local errors overflows throughput
-    errors=$(echo "$last_row" | cut -d',' -f9)
-    overflows=$(echo "$last_row" | cut -d',' -f10)
-    throughput=$(echo "$last_row" | cut -d',' -f5)
+    errors=$(echo "$last_row"     | cut -d',' -f"$(col_idx "$header" Errors)")
+    overflows=$(echo "$last_row"  | cut -d',' -f"$(col_idx "$header" Overflows)")
+    throughput=$(echo "$last_row" | cut -d',' -f"$(col_idx "$header" Throughput)")
     [[ "$errors"    == "0" ]] || fail "${tag}: errors=$errors in clean-network run (expected 0)"
     [[ "$overflows" == "0" ]] || fail "${tag}: overflows=$overflows (per-client buffer cap exceeded)"
     awk -v t="$throughput" 'BEGIN { exit !(t > 0) }' \
         || fail "${tag}: throughput=$throughput (expected > 0)"
 
-    # ---- Assertion: server.log + pidstat.log are non-empty ------------------
-    [[ -s "$run_dir/server.log"  ]] || fail "${tag}: server.log is empty"
-    [[ -s "$run_dir/pidstat.log" ]] || fail "${tag}: pidstat.log is empty"
+    # ---- Assertion: server.log + server_pidstat.log are non-empty -----------
+    [[ -s "$run_dir/server.log"         ]] || fail "${tag}: server.log is empty"
+    [[ -s "$run_dir/server_pidstat.log" ]] || fail "${tag}: server_pidstat.log is empty"
 
     ok "PASS: ${tag}  (samples=${raw_samples}, throughput=${throughput} msg/s)"
 }

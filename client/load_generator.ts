@@ -30,6 +30,14 @@ interface Args {
     duration: number;     // seconds
     clients: number;      // concurrency
     resultsDir: string;   // where rtts.csv + metrics.csv live
+    // Self-describing dimensions, injected by the harness via RUN_* env vars.
+    // When run standalone (no harness), these fall back to safe placeholders so
+    // the metrics row is still well-formed.
+    profile: string;          // ideal | high_latency | packet_loss | crossover | profiling | smoke | standalone
+    runtime: string;          // node | deno | bun | unknown
+    protocolVariant: string;  // full variant (e.g. webtransport-fails-components); defaults to protocol
+    packetLossPct: string;    // numeric string, or "" if unknown
+    delayMs: string;          // numeric string, or "" if unknown
 }
 
 function parseArgs(argv: string[]): Args {
@@ -73,10 +81,22 @@ function parseArgs(argv: string[]): Args {
         throw new Error(`--clients must be a positive integer`);
     }
 
-    // RESULTS_DIR is set by run_test.sh per-run; fall back to ./results.
+    // RESULTS_DIR is set by harness_run_test.sh per-run; fall back to ./results.
     const resultsDir = map.get('results-dir') ?? Deno.env.get('RESULTS_DIR') ?? './results';
 
-    return { target: get('target'), protocol, duration, clients, resultsDir };
+    // Self-describing dimensions injected by the harness (harness_run_test.sh).
+    // Standalone runs (no harness) get placeholders so the row stays well-formed.
+    const env = (k: string): string => Deno.env.get(k) ?? '';
+    const profile = env('RUN_PROFILE') || 'standalone';
+    const runtime = env('RUN_RUNTIME') || 'unknown';
+    const protocolVariant = env('RUN_VARIANT') || protocol;
+    const packetLossPct = env('RUN_LOSS_PCT'); // "" if unset
+    const delayMs = env('RUN_DELAY_MS');       // "" if unset
+
+    return {
+        target: get('target'), protocol, duration, clients, resultsDir,
+        profile, runtime, protocolVariant, packetLossPct, delayMs,
+    };
 }
 
 // ============================================================================
@@ -592,7 +612,7 @@ function mergeRtts(buffers: RttBuffer[]): Float64Array {
 // CSV output
 // ============================================================================
 
-const METRICS_HEADER = 'Timestamp,Protocol,Concurrency,DurationSec,Throughput,p50_ms,p95_ms,p99_ms,Errors,Overflows,MeanConnect_ms\n';
+const METRICS_HEADER = 'Timestamp,Profile,Runtime,ProtocolVariant,Protocol,Concurrency,DurationSec,PacketLossPct,DelayMs,Throughput,p50_ms,p95_ms,p99_ms,Errors,Overflows,MeanConnect_ms\n';
 
 async function appendMetricsRow(metricsPath: string, row: string): Promise<void> {
     let needsHeader = false;
@@ -719,9 +739,14 @@ async function main(): Promise<void> {
 
     const row = [
         new Date().toISOString(),
+        args.profile,           // self-describing dimensions (from harness env)
+        args.runtime,
+        args.protocolVariant,
         args.protocol,
         args.clients,
         args.duration,
+        args.packetLossPct,     // numeric string or "" if unknown
+        args.delayMs,           // numeric string or "" if unknown
         throughput.toFixed(3),
         p50.toFixed(4),
         p95.toFixed(4),
