@@ -14,7 +14,12 @@ if (!Number.isInteger(port) || port <= 0) {
     Deno.exit(1);
 }
 
-Deno.serve({ hostname: host, port }, (req) => {
+// TLS (wss://) for a fair comparison vs WebTransport; same cert idiom as webtransport.ts.
+const certDir = new URL('../', import.meta.url);
+const cert = await Deno.readTextFile(new URL('cert.pem', certDir));
+const key = await Deno.readTextFile(new URL('key.pem', certDir));
+
+Deno.serve({ hostname: host, port, cert, key }, (req) => {
     if (req.headers.get('upgrade')?.toLowerCase() !== 'websocket') {
         return new Response('expected websocket upgrade', { status: 426 });
     }

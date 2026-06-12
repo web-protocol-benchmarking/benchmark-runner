@@ -4,6 +4,9 @@
 //   Body: 30-byte JSON payload from the client.
 //   Response: the exact same bytes, Content-Type application/json.
 
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+
 const host = process.env.SERVER_IP;
 const port = Number(process.env.SERVER_PORT);
 
@@ -16,9 +19,14 @@ if (!Number.isInteger(port) || port <= 0) {
     process.exit(1);
 }
 
+// TLS (https://) for a fair comparison vs WebTransport (which mandates TLS).
+const certPem = readFileSync(join(import.meta.dir, '../cert.pem'), 'utf-8');
+const keyPem  = readFileSync(join(import.meta.dir, '../key.pem'),  'utf-8');
+
 Bun.serve({
     hostname: host,
     port,
+    tls: { cert: certPem, key: keyPem },
     async fetch(req) {
         if (req.method !== 'POST' || new URL(req.url).pathname !== '/echo') {
             return new Response(null, { status: 404 });

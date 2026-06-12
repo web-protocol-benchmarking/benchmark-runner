@@ -178,7 +178,7 @@ class WebSocketClient implements ProtocolClient {
 
         return new Promise((resolve) => {
             const connectStart = performance.now();
-            const ws = new WebSocket(`ws://${this.target}/`);
+            const ws = new WebSocket(`wss://${this.target}/`);
             let sendStart = 0;
             let nextId = 0;
             let settled = false;
@@ -240,12 +240,21 @@ class WebSocketClient implements ProtocolClient {
 // arrives on the stream, so a single inflight resolver is sufficient.
 
 class SseClient implements ProtocolClient {
+    // http2: false pins the SEND path (the POST /send fetch) to HTTP/1.1 — see
+    // LongPollingClient for the rationale. CAVEAT: the receive path is an
+    // EventSource, and Deno's EventSource exposes no ALPN/version control, so the
+    // event stream against the Deno server unavoidably negotiates h2 (node/bun only
+    // offer h1.1, so they stay h1.1). This residual is minor — SSE's per-echo RTT
+    // is ~2ms, i.e. it does NOT hit the ~42ms h2 hanging-response stall that
+    // long-polling did — but it is documented for honesty in the methodology.
+    private readonly httpClient: Deno.HttpClient = Deno.createHttpClient({ http2: false });
+
     constructor(private readonly target: string, private readonly clientId: number) {}
 
     run(stopSignal: AbortSignal): Promise<ClientStats> {
         const stats: ClientStats = { connectTimeMs: -1, echoesOk: 0, errors: 0, rtts: new RttBuffer() };
         const idParam = `bench-${this.clientId}-${Date.now()}`;
-        const base = `http://${this.target}`;
+        const base = `https://${this.target}`;
         const eventsUrl = `${base}/events?clientId=${idParam}`;
         const sendUrl = `${base}/send?clientId=${idParam}`;
 
@@ -261,6 +270,7 @@ class SseClient implements ProtocolClient {
                 settled = true;
                 stopSignal.removeEventListener('abort', onAbort);
                 try { es.close(); } catch { /* ignore */ }
+                try { this.httpClient.close(); } catch { /* ignore */ }
                 resolve(stats);
             };
 
@@ -281,6 +291,7 @@ class SseClient implements ProtocolClient {
                             method: 'POST',
                             body: payload,
                             headers: { 'Content-Type': 'application/json' },
+                            client: this.httpClient,
                         });
                         if (!r.ok) {
                             stats.errors++;
@@ -334,11 +345,19 @@ class SseClient implements ProtocolClient {
 // handshake costs measured per iteration.
 
 class ShortPollingClient implements ProtocolClient {
+    // http2: false pins this client to HTTP/1.1 — see LongPollingClient for the
+    // full rationale. The TLS Deno servers advertise h2 in ALPN (node/bun do
+    // not), so without the pin the Deno client upgrades to h2 *only* against the
+    // Deno server, paying ~1.8x the per-request cost (measured) and breaking the
+    // cross-runtime comparison. Pinning keeps "short-polling over TLS" on the same
+    // wire protocol (HTTP/1.1 + TLS) against all three runtimes.
+    private readonly httpClient: Deno.HttpClient = Deno.createHttpClient({ http2: false });
+
     constructor(private readonly target: string, private readonly clientId: number) {}
 
     async run(stopSignal: AbortSignal): Promise<ClientStats> {
         const stats: ClientStats = { connectTimeMs: -1, echoesOk: 0, errors: 0, rtts: new RttBuffer() };
-        const url = `http://${this.target}/echo`;
+        const url = `https://${this.target}/echo`;
         let nextId = 0;
         const connectStart = performance.now();
         let firstRequest = true;
@@ -350,6 +369,7 @@ class ShortPollingClient implements ProtocolClient {
                     method: 'POST',
                     body: makePayload(nextId++, Date.now()),
                     headers: { 'Content-Type': 'application/json' },
+                    client: this.httpClient,
                 });
                 if (!r.ok) {
                     stats.errors++;
@@ -368,6 +388,7 @@ class ShortPollingClient implements ProtocolClient {
                 stats.errors++;
             }
         }
+        this.httpClient.close();
         return stats;
     }
 }
@@ -399,14 +420,25 @@ class LongPollingClient implements ProtocolClient {
     // GET and the POST don't compete with other clients for the global pool.
     // Without isolation, 50 clients × 2 concurrent requests = 100 connections
     // deadlock the shared pool: GETs hold all slots, POSTs can never connect.
-    private readonly httpClient: Deno.HttpClient = Deno.createHttpClient({ poolSize: 2 });
+    //
+    // http2: false pins this client to HTTP/1.1. The TLS servers all advertise
+    // BOTH h2 and http/1.1 in ALPN — but only Deno.serve does (node's https is
+    // HTTP/1.1-only, bun serves HTTP/1.1). Without this pin, the Deno client
+    // opportunistically upgrades to h2 *only* against the Deno server, where the
+    // hanging-GET/paired-POST choreography hits an ~42ms h2 frame-flush stall per
+    // round trip (a ~40ms delayed-ACK-class timer, measured even on loopback),
+    // collapsing throughput ~9x vs node/bun. Pinning h1.1 makes "long-polling over
+    // TLS" mean the same wire protocol (HTTP/1.1 + TLS) against all three runtimes,
+    // restoring an apples-to-apples comparison. node/bun paths are unaffected
+    // (they only ever offered h1.1).
+    private readonly httpClient: Deno.HttpClient = Deno.createHttpClient({ poolSize: 2, http2: false });
 
     constructor(private readonly target: string, private readonly clientId: number) {}
 
     async run(stopSignal: AbortSignal): Promise<ClientStats> {
         const stats: ClientStats = { connectTimeMs: -1, echoesOk: 0, errors: 0, rtts: new RttBuffer() };
         const idParam = `bench-${this.clientId}-${Date.now()}`;
-        const base = `http://${this.target}`;
+        const base = `https://${this.target}`;
         const getUrl = `${base}/?clientId=${idParam}`;
         const postUrl = `${base}/?clientId=${idParam}`;
         let nextId = 0;

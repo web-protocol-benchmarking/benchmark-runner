@@ -30,7 +30,7 @@ PROFILING_DIR="$RESULTS_BASE/profiling"
 # 15s is plenty of wall-clock to collect a representative flamegraph without
 # bloating perf.data. Same concurrency / core pinning as the full sweep so the
 # captured profile reflects the same load shape.
-DURATION=5
+DURATION=30
 CLIENTS=50
 SERVER_CORES="0"
 CLIENT_CORES="1,2"
@@ -96,7 +96,7 @@ run_one_profile() {
     local wt_flag=""
     [[ "$proto" == webtransport* ]] && client_proto="webtransport" && wt_flag="--unstable-net"
 
-    local client_cmd="deno run --allow-net --allow-read --allow-write --allow-env $wt_flag \
+    local client_cmd="deno run --allow-net --allow-read --allow-write --allow-env --unsafely-ignore-certificate-errors $wt_flag \
         $CLIENT_SCRIPT \
         --target \$SERVER_IP:\$SERVER_PORT \
         --protocol $client_proto \

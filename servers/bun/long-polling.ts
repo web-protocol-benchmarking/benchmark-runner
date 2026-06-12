@@ -8,6 +8,9 @@
 //                          resolves the matching hanging GET with the body.
 //                          409 if no GET is currently waiting for clientId.
 
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+
 const host = process.env.SERVER_IP;
 const port = Number(process.env.SERVER_PORT);
 
@@ -26,9 +29,14 @@ interface Pending {
 
 const pending = new Map<string, Pending>();
 
+// TLS (https://) for a fair comparison vs WebTransport (which mandates TLS).
+const certPem = readFileSync(join(import.meta.dir, '../cert.pem'), 'utf-8');
+const keyPem  = readFileSync(join(import.meta.dir, '../key.pem'),  'utf-8');
+
 Bun.serve({
     hostname: host,
     port,
+    tls: { cert: certPem, key: keyPem },
     async fetch(req) {
         const url = new URL(req.url);
         const clientId = url.searchParams.get('clientId');

@@ -23,7 +23,12 @@ if (!Number.isInteger(port) || port <= 0) {
 const streams = new Map<string, ReadableStreamDefaultController<Uint8Array>>();
 const encoder = new TextEncoder();
 
-Deno.serve({ hostname: host, port }, (req) => {
+// TLS (https://) for a fair comparison vs WebTransport; same cert idiom as webtransport.ts.
+const certDir = new URL('../', import.meta.url);
+const cert = await Deno.readTextFile(new URL('cert.pem', certDir));
+const key = await Deno.readTextFile(new URL('key.pem', certDir));
+
+Deno.serve({ hostname: host, port, cert, key }, (req) => {
     const url = new URL(req.url);
 
     if (req.method === 'GET' && url.pathname === '/events') {

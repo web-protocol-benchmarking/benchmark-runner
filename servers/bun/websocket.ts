@@ -1,5 +1,9 @@
-// WebSocket echo server (Bun, native Bun.serve).
+// WebSocket echo server (Bun, native Bun.serve) over TLS (wss://).
 // Binds explicitly to SERVER_IP inside ns_server — never localhost.
+// TLS so the comparison is fair vs WebTransport (which mandates TLS).
+
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 
 const host = process.env.SERVER_IP;
 const port = Number(process.env.SERVER_PORT);
@@ -13,9 +17,13 @@ if (!Number.isInteger(port) || port <= 0) {
     process.exit(1);
 }
 
+const certPem = readFileSync(join(import.meta.dir, '../cert.pem'), 'utf-8');
+const keyPem  = readFileSync(join(import.meta.dir, '../key.pem'),  'utf-8');
+
 Bun.serve({
     hostname: host,
     port,
+    tls: { cert: certPem, key: keyPem },
     fetch(req, server) {
         if (server.upgrade(req)) return; // upgraded — handled by websocket{}
         return new Response('expected websocket upgrade', { status: 426 });
@@ -34,4 +42,4 @@ Bun.serve({
     },
 });
 
-console.log(`ws echo listening on ${host}:${port}`);
+console.log(`wss echo listening on ${host}:${port}`);

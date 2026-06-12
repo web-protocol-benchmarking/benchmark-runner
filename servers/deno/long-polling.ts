@@ -32,7 +32,12 @@ interface Pending {
 
 const pending = new Map<string, Pending>();
 
-Deno.serve({ hostname: host, port }, async (req) => {
+// TLS (https://) for a fair comparison vs WebTransport; same cert idiom as webtransport.ts.
+const certDir = new URL('../', import.meta.url);
+const cert = await Deno.readTextFile(new URL('cert.pem', certDir));
+const key = await Deno.readTextFile(new URL('key.pem', certDir));
+
+Deno.serve({ hostname: host, port, cert, key }, async (req) => {
     const url = new URL(req.url);
     const clientId = url.searchParams.get('clientId');
     if (!clientId) return new Response('clientId required', { status: 400 });

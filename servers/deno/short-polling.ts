@@ -17,7 +17,12 @@ if (!Number.isInteger(port) || port <= 0) {
     Deno.exit(1);
 }
 
-Deno.serve({ hostname: host, port }, async (req) => {
+// TLS (https://) for a fair comparison vs WebTransport; same cert idiom as webtransport.ts.
+const certDir = new URL('../', import.meta.url);
+const cert = await Deno.readTextFile(new URL('cert.pem', certDir));
+const key = await Deno.readTextFile(new URL('key.pem', certDir));
+
+Deno.serve({ hostname: host, port, cert, key }, async (req) => {
     if (req.method !== 'POST' || new URL(req.url).pathname !== '/echo') {
         return new Response(null, { status: 404 });
     }

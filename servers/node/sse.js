@@ -8,7 +8,10 @@
 // The clientId binds a POST to the correct open stream. Strict per-client echo:
 // the payload is only delivered to the stream registered under that id.
 
-import { createServer } from 'node:http';
+import { createServer } from 'node:https';
+import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const host = process.env.SERVER_IP;
 const port = Number(process.env.SERVER_PORT);
@@ -46,7 +49,11 @@ function readBody(req, limitBytes = 64 * 1024) {
     });
 }
 
-const server = createServer(async (req, res) => {
+const dir = dirname(fileURLToPath(import.meta.url));
+const cert = readFileSync(join(dir, '../cert.pem'), 'utf8');
+const key = readFileSync(join(dir, '../key.pem'), 'utf8');
+
+const server = createServer({ cert, key }, async (req, res) => {
     const url = new URL(req.url, 'http://placeholder');
 
     if (req.method === 'GET' && url.pathname === '/events') {

@@ -1,6 +1,12 @@
-// WebSocket echo server (Node.js, `ws` package, ESM).
+// WebSocket echo server (Node.js, `ws` package, ESM) over TLS (wss://).
 // Binds explicitly to SERVER_IP inside ns_server — never localhost.
+// TLS so the comparison is fair vs WebTransport (which mandates TLS); `ws`
+// can't terminate TLS itself, so we attach it to an https server.
 
+import { createServer } from 'node:https';
+import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { WebSocketServer } from 'ws';
 
 const host = process.env.SERVER_IP;
@@ -15,11 +21,17 @@ if (!Number.isInteger(port) || port <= 0) {
     process.exit(1);
 }
 
-const wss = new WebSocketServer({ host, port });
+const dir = dirname(fileURLToPath(import.meta.url));
+const cert = readFileSync(join(dir, '../cert.pem'), 'utf8');
+const key = readFileSync(join(dir, '../key.pem'), 'utf8');
 
-wss.on('listening', () => {
-    console.log(`ws echo listening on ${host}:${port}`);
+const httpsServer = createServer({ cert, key });
+const wss = new WebSocketServer({ server: httpsServer });
+
+httpsServer.on('listening', () => {
+    console.log(`wss echo listening on ${host}:${port}`);
 });
+httpsServer.listen(port, host);
 
 wss.on('connection', (ws, req) => {
     const peer = `${req.socket.remoteAddress}:${req.socket.remotePort}`;
@@ -39,9 +51,15 @@ wss.on('error', (err) => {
     process.exit(1);
 });
 
+// Bind/TLS errors now surface on the https server (wss is attached to it).
+httpsServer.on('error', (err) => {
+    console.error('server error:', err);
+    process.exit(1);
+});
+
 for (const sig of ['SIGINT', 'SIGTERM']) {
     process.on(sig, () => {
         console.log(`received ${sig}, closing`);
-        wss.close(() => process.exit(0));
+        wss.close(() => httpsServer.close(() => process.exit(0)));
     });
 }

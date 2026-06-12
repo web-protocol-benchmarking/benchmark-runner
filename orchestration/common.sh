@@ -107,5 +107,16 @@ run_preflight() {
         fail "@webtransport-bun/webtransport not installed. Run: (cd $REPO_ROOT/servers/bun && bun install)"
     fi
 
-    ok "pre-flight checks passed (node, deno, bun, pidstat, all server sources)"
+    # TLS cert is required by EVERY protocol now (WebTransport over QUIC + the
+    # wss/https servers). Assert presence (hard) and freshness (soft warning):
+    # an expired cert still works — WT pins by hash and the client connects with
+    # --unsafely-ignore-certificate-errors — so expiry is a warning, not a failure.
+    [[ -f "$REPO_ROOT/servers/cert.pem" && -f "$REPO_ROOT/servers/key.pem" ]] \
+        || fail "servers/cert.pem or key.pem missing. Run: $REPO_ROOT/servers/gen_cert.sh"
+    if command -v openssl >/dev/null 2>&1 \
+            && ! openssl x509 -checkend 0 -noout -in "$REPO_ROOT/servers/cert.pem" >/dev/null 2>&1; then
+        yellow "WARN: servers/cert.pem is expired (tolerated, but consider: $REPO_ROOT/servers/gen_cert.sh)"
+    fi
+
+    ok "pre-flight checks passed (node, deno, bun, pidstat, cert, all server sources)"
 }

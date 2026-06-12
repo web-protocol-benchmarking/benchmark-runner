@@ -12,7 +12,10 @@
 // Strict echo: only the GET registered under the matching clientId receives
 // the payload, and it receives the exact bytes from the POST.
 
-import { createServer } from 'node:http';
+import { createServer } from 'node:https';
+import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const host = process.env.SERVER_IP;
 const port = Number(process.env.SERVER_PORT);
@@ -47,7 +50,11 @@ function readBody(req, limitBytes = 64 * 1024) {
     });
 }
 
-const server = createServer(async (req, res) => {
+const dir = dirname(fileURLToPath(import.meta.url));
+const cert = readFileSync(join(dir, '../cert.pem'), 'utf8');
+const key = readFileSync(join(dir, '../key.pem'), 'utf8');
+
+const server = createServer({ cert, key }, async (req, res) => {
     const url = new URL(req.url, 'http://placeholder');
     const clientId = url.searchParams.get('clientId');
     if (!clientId) {
