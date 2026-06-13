@@ -3,9 +3,10 @@
 # sweep_profiling.sh — Targeted CPU profiling sweep for flamegraph generation.
 # Driver: calls the core harness (harness_run_test.sh) with --profile.
 #
-# Unlike sweep_benchmark.sh (the full 45-run matrix), this profiles only the
-# WebSocket baseline vs the WebTransport implementation for each runtime, under
-# the IDEAL network profile ONLY (no loss/delay). perf adds observer overhead
+# Unlike sweep_benchmark.sh (the full 54-run matrix), this profiles only the
+# WebSocket baseline vs the WebTransport implementations (reliable stream +
+# unreliable datagram) for each runtime, under the IDEAL network profile ONLY
+# (no loss/delay). perf adds observer overhead
 # and produces large perf.data files, so we deliberately keep the set small.
 #
 # Each run is launched through harness_run_test.sh with --profile, which wraps the
@@ -44,10 +45,10 @@ DELAY="0ms"
 # so all dirs from this invocation group together.
 SWEEP_STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 
-# --- Targeted combinations: WS baseline vs WT impl, per runtime ---------------
+# --- Targeted combinations: WS baseline vs WT impls (reliable + datagram), per runtime ---
 # Parallel arrays: PROFILE_RUNTIMES[i] runs PROFILE_PROTOS[i].
-PROFILE_RUNTIMES=(node node                          deno deno          bun  bun)
-PROFILE_PROTOS=(  ws   webtransport-fails-components  ws   webtransport  ws   webtransport-vmeansdev)
+PROFILE_RUNTIMES=(node node                          node                   deno deno         deno                   bun  bun                    bun)
+PROFILE_PROTOS=(  ws   webtransport-fails-components  webtransport-datagram  ws   webtransport webtransport-datagram  ws   webtransport-vmeansdev webtransport-datagram)
 
 # --- Pre-flight ---------------------------------------------------------------
 run_preflight
@@ -80,6 +81,7 @@ profile_label() {
         webtransport)                  echo "$rt_name WebTransport (native)" ;;
         webtransport-fails-components) echo "$rt_name WebTransport (fails-components)" ;;
         webtransport-vmeansdev)        echo "$rt_name WebTransport (vmeansdev)" ;;
+        webtransport-datagram)         echo "$rt_name WebTransport (datagram)" ;;
         *)                             echo "$rt_name $proto" ;;
     esac
 }
@@ -91,10 +93,15 @@ run_one_profile() {
     server_cmd=$(server_cmd_for "$runtime" "$proto")
     label=$(profile_label "$runtime" "$proto")
 
-    # All webtransport variants drive the client with --protocol webtransport.
+    # Reliable webtransport-* variants drive --protocol webtransport;
+    # webtransport-datagram selects the unreliable datagram client.
     local client_proto="$proto"
     local wt_flag=""
-    [[ "$proto" == webtransport* ]] && client_proto="webtransport" && wt_flag="--unstable-net"
+    if [[ "$proto" == "webtransport-datagram" ]]; then
+        client_proto="webtransport-datagram"; wt_flag="--unstable-net"
+    elif [[ "$proto" == webtransport* ]]; then
+        client_proto="webtransport"; wt_flag="--unstable-net"
+    fi
 
     local client_cmd="deno run --allow-net --allow-read --allow-write --allow-env --unsafely-ignore-certificate-errors $wt_flag \
         $CLIENT_SCRIPT \

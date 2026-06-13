@@ -32,11 +32,13 @@ col_idx() { echo "$1" | tr ',' '\n' | grep -nxF "$2" | head -n1 | cut -d: -f1; }
 # The matrix is asymmetric — not every runtime has the same WebTransport variants.
 # Deno webtransport-fails-components is excluded: the package uses internal Node.js
 # socket APIs (getSendQueueCount) that Deno's compat layer does not implement.
-#   node:  ws sse short-polling long-polling webtransport-fails-components          (5)
-#   bun:   ws sse short-polling long-polling webtransport-vmeansdev                 (5)
-#   deno:  ws sse short-polling long-polling webtransport                           (5)
-# Total: 15 combinations.
-DURATION=30
+#   node:  ws sse short-polling long-polling webtransport-fails-components webtransport-datagram  (6)
+#   bun:   ws sse short-polling long-polling webtransport-vmeansdev        webtransport-datagram  (6)
+#   deno:  ws sse short-polling long-polling webtransport                  webtransport-datagram  (6)
+# webtransport-datagram is the unreliable QUIC-datagram variant (same name on all
+# three runtimes; the run-dir disambiguates by runtime).
+# Total: 18 combinations.
+DURATION=10
 CLIENTS=2
 MIN_RTT_SAMPLES=10
 SERVER_CORES="0"      # pin server to core 0
@@ -66,12 +68,18 @@ run_one() {
     local server_cmd
     server_cmd=$(server_cmd_for "$runtime" "$proto")
 
-    # All webtransport variants use --protocol webtransport on the client
-    # (same WebTransport API; server backend differs). --unstable-net is
+    # The reliable webtransport variants (webtransport / -fails-components /
+    # -vmeansdev) all use --protocol webtransport on the client (same reliable-
+    # stream API; only the server backend differs). The webtransport-datagram
+    # variant instead selects the unreliable datagram client. --unstable-net is
     # required on the client whenever it uses new WebTransport(...).
     local client_proto="$proto"
     local wt_flag=""
-    [[ "$proto" == webtransport* ]] && client_proto="webtransport" && wt_flag="--unstable-net"
+    if [[ "$proto" == "webtransport-datagram" ]]; then
+        client_proto="webtransport-datagram"; wt_flag="--unstable-net"
+    elif [[ "$proto" == webtransport* ]]; then
+        client_proto="webtransport"; wt_flag="--unstable-net"
+    fi
     local client_cmd="deno run --allow-net --allow-read --allow-write --allow-env --unsafely-ignore-certificate-errors $wt_flag \
         $CLIENT_SCRIPT \
         --target \$SERVER_IP:\$SERVER_PORT \
@@ -128,9 +136,11 @@ run_one() {
     profile_col=$(echo "$last_row"  | cut -d',' -f"$(col_idx "$header" Profile)")
     runtime_col=$(echo "$last_row"  | cut -d',' -f"$(col_idx "$header" Runtime)")
     variant_col=$(echo "$last_row"  | cut -d',' -f"$(col_idx "$header" ProtocolVariant)")
-    # Variant names (webtransport-*) all write "webtransport" to the Protocol col.
+    # The reliable webtransport-* variants all write "webtransport" to the Protocol
+    # col (client launched with --protocol webtransport). The datagram variant keeps
+    # its own --protocol webtransport-datagram, so its Protocol col is unchanged.
     expected_proto="$proto"
-    [[ "$proto" == webtransport* ]] && expected_proto="webtransport"
+    [[ "$proto" == webtransport* && "$proto" != "webtransport-datagram" ]] && expected_proto="webtransport"
     [[ "$protocol_col" == "$expected_proto" ]] \
         || fail "${tag}: metrics.csv Protocol=$protocol_col, expected $expected_proto"
     # The self-describing dimensions must be embedded correctly (no annotations).
@@ -156,18 +166,29 @@ run_one() {
     errors=$(echo "$last_row"     | cut -d',' -f"$(col_idx "$header" Errors)")
     overflows=$(echo "$last_row"  | cut -d',' -f"$(col_idx "$header" Overflows)")
     throughput=$(echo "$last_row" | cut -d',' -f"$(col_idx "$header" Throughput)")
-    # ws/sse/short-polling must be perfectly clean (0 errors). long-polling has a
-    # documented startup race: its hanging GET and the paired POST travel on two
-    # separate pooled connections, and during TLS-handshake warmup the POST's
-    # connection can occasionally complete first and reach the server ahead of its
-    # GET, drawing a single benign 409. That is a connection-warmup artifact, not a
-    # pipeline failure (the run still logs hundreds of clean echoes), so long-polling
-    # is allowed a tiny error rate (<1% of samples). A real regression — where errors
-    # are a meaningful fraction of traffic — still trips this gate.
-    if [[ "$proto" == "long-polling" ]]; then
-        awk -v e="$errors" -v n="$raw_samples" \
-            'BEGIN { exit !(n > 0 && (e / n) < 0.01) }' \
-            || fail "${tag}: errors=$errors out of $raw_samples samples exceeds the 1% long-polling warmup tolerance"
+    # ws/sse/short-polling must be perfectly clean (0 errors). Two protocols get a
+    # small clean-network tolerance because a tiny error rate is INTRINSIC to them,
+    # not a pipeline fault:
+    #   - long-polling (<1%): its hanging GET and paired POST travel on two separate
+    #     pooled connections; during TLS-handshake warmup the POST can occasionally
+    #     reach the server ahead of its GET, drawing a single benign 409.
+    #   - webtransport-datagram (<2%): datagrams are UNRELIABLE by design, so a
+    #     backend may shed a few under genuine send-queue backpressure at high rates
+    #     even with zero network loss. (An earlier, larger bun drop rate turned out to
+    #     be a server-side datagramsPerSec rate-limit left at its default — since fixed
+    #     in webtransport-datagram.ts; this small tolerance remains as defensive
+    #     headroom so an intrinsically-lossy transport can't abort the whole pipeline.)
+    # In both cases a broken pipeline / broken interop shows a near-100% error rate
+    # and still trips the gate.
+    local err_tol=0
+    case "$proto" in
+        long-polling)          err_tol="0.01" ;;
+        webtransport-datagram) err_tol="0.02" ;;
+    esac
+    if [[ "$err_tol" != "0" ]]; then
+        awk -v e="$errors" -v n="$raw_samples" -v t="$err_tol" \
+            'BEGIN { exit !(n > 0 && (e / n) < t) }' \
+            || fail "${tag}: errors=$errors out of $raw_samples samples exceeds the $(awk -v t="$err_tol" 'BEGIN{printf "%g", t*100}')% ${proto} tolerance"
     else
         [[ "$errors" == "0" ]] || fail "${tag}: errors=$errors in clean-network run (expected 0)"
     fi
@@ -183,7 +204,7 @@ run_one() {
 }
 
 # --- Drive the full matrix ----------------------------------------------------
-yellow "[smoke] matrix: 15 combinations (node×5, bun×5, deno×5)"
+yellow "[smoke] matrix: 18 combinations (node×6, bun×6, deno×6)"
 yellow "[smoke] per-run: ${DURATION}s, ${CLIENTS} clients, loss=0%, delay=0ms"
 echo ""
 

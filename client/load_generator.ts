@@ -22,7 +22,7 @@
 // CLI parsing
 // ============================================================================
 
-type Protocol = 'ws' | 'sse' | 'short-polling' | 'long-polling' | 'webtransport';
+type Protocol = 'ws' | 'sse' | 'short-polling' | 'long-polling' | 'webtransport' | 'webtransport-datagram';
 
 interface Args {
     target: string;       // "host:port"
@@ -66,9 +66,10 @@ function parseArgs(argv: string[]): Args {
         protocol !== 'sse' &&
         protocol !== 'short-polling' &&
         protocol !== 'long-polling' &&
-        protocol !== 'webtransport'
+        protocol !== 'webtransport' &&
+        protocol !== 'webtransport-datagram'
     ) {
-        throw new Error(`--protocol must be one of: ws, sse, short-polling, long-polling, webtransport`);
+        throw new Error(`--protocol must be one of: ws, sse, short-polling, long-polling, webtransport, webtransport-datagram`);
     }
 
     const duration = Number(get('duration'));
@@ -447,8 +448,15 @@ class LongPollingClient implements ProtocolClient {
 
         while (!stopSignal.aborted) {
             // Open hanging GET first; the server will only respond once the
-            // matching POST arrives.
-            const getPromise = fetch(getUrl, { method: 'GET', client: this.httpClient, signal: stopSignal });
+            // matching POST arrives. A per-iteration AbortController lets us cancel
+            // THIS GET if its paired POST fails (see below); AbortSignal.any folds in
+            // the run-wide stopSignal so end-of-run still aborts it.
+            const getAbort = new AbortController();
+            const getPromise = fetch(getUrl, {
+                method: 'GET',
+                client: this.httpClient,
+                signal: AbortSignal.any([stopSignal, getAbort.signal]),
+            });
             // Suppress unhandled-rejection in the microtask gap between here and
             // the `await getPromise` below — the rejection is re-thrown there.
             getPromise.catch(() => {});
@@ -478,6 +486,14 @@ class LongPollingClient implements ProtocolClient {
             } catch (e) {
                 if ((e as Error).name !== 'AbortError') stats.errors++;
             }
+
+            // If the POST never delivered, the server is holding the hanging GET
+            // open waiting for a matching POST that will never come — `await
+            // getPromise` would then block until end-of-run, burning the whole run
+            // as a 0-sample deadlock (observed under cold-TLS warmup races). Cancel
+            // the orphaned GET so the loop recovers and retries; the server drops its
+            // pending entry on the GET's abort.
+            if (!postOk) getAbort.abort();
 
             // Always await the GET so it doesn't leak, even if the POST failed.
             try {
@@ -600,6 +616,164 @@ class WebTransportClient implements ProtocolClient {
 }
 
 // ============================================================================
+// WebTransport DATAGRAM client (unreliable, unordered)
+// ============================================================================
+//
+// The reliable WebTransportClient above writes over a single bidirectional QUIC
+// stream (in-order, retransmitted) — so under loss it stalls exactly like TCP.
+// This variant uses the unreliable WebTransport Datagram API: a dropped datagram
+// is simply lost (no retransmit, no head-of-line blocking), so the closed loop
+// must tolerate losses rather than wait forever for them.
+//
+// Two problems an unreliable depth=1 loop must solve, and how this design does:
+//   1. Deadlock — a naive `send; await read` blocks forever the first time a
+//      request OR its echo is dropped. Fix: each send waits on a per-sequence
+//      promise raced against DATAGRAM_RECV_TIMEOUT_MS; a timeout counts the
+//      message as lost (errors++) and the loop continues to the next send.
+//   2. RTT misattribution — racing read() against a timeout would leave the
+//      abandoned read() pending; after a loss those orphaned reads pile up and a
+//      later echo resolves the wrong waiter. Fix: a SINGLE persistent receiver
+//      loop owns the only reader (never abandoned) and matches each echo to its
+//      waiter by a 4-byte big-endian sequence prefix. A late echo whose waiter
+//      already timed out matches nothing and is dropped.
+//
+// depth=1 is preserved: the sender writes exactly one datagram and waits for its
+// echo (or timeout) before sending the next. The body is the same makePayload
+// bytes as every other protocol, prefixed with the 4-byte seq (~42 bytes total,
+// far under the ~1200-byte datagram limit). The server echoes raw bytes, so the
+// prefix round-trips with no server-side parsing.
+//
+// DATAGRAM_RECV_TIMEOUT_MS is a methodological parameter: a datagram with no echo
+// within this window is declared lost. Because datagrams are never retransmitted,
+// at depth=1 this timeout IS the per-loss penalty (pure dead time — nothing else is
+// in flight), so it dominates throughput under loss. It is set just above the
+// measured successful-RTT distribution: even at 10% loss, datagram round trips that
+// DO complete stay at ~105ms p50 / ~120ms p99 (loss only removes datagrams, it does
+// not slow the survivors), so 150ms gives a small headroom over p99 while keeping the
+// give-up fast. Trade-off: the ~1% tail of slow-but-not-lost datagrams above 150ms is
+// counted as a (false) loss. Canary — if Errors at loss=0% is >0 after a run, the
+// window is clipping legitimate slow echoes and should be raised (e.g. 250-400ms).
+
+const DATAGRAM_RECV_TIMEOUT_MS = 150;
+
+class WebTransportDatagramClient implements ProtocolClient {
+    constructor(
+        private readonly target: string,
+        private readonly clientId: number,
+        private readonly certHash: ArrayBuffer,
+    ) {}
+
+    async run(stopSignal: AbortSignal): Promise<ClientStats> {
+        const stats: ClientStats = { connectTimeMs: -1, echoesOk: 0, errors: 0, rtts: new RttBuffer() };
+        const encoder = new TextEncoder();
+
+        const connectStart = performance.now();
+        let wt: WebTransport;
+        try {
+            wt = new WebTransport(`https://${this.target}`, {
+                serverCertificateHashes: [{ algorithm: 'sha-256', value: this.certHash }],
+                allowPooling: false,
+            });
+            // Consume wt.closed's rejection (same rationale as WebTransportClient).
+            wt.closed.catch(() => { /* recorded via the ready/echo paths */ });
+            await wt.ready;
+        } catch (err) {
+            stats.errors++;
+            console.error(`[wt-datagram client ${this.clientId}] connect failed:`, err);
+            return stats;
+        }
+        stats.connectTimeMs = performance.now() - connectStart;
+
+        const writer = wt.datagrams.writable.getWriter();
+        const reader = wt.datagrams.readable.getReader();
+
+        // Waiters keyed by sequence number; the receiver loop resolves them.
+        const waiters = new Map<number, (arrivalMs: number) => void>();
+
+        // Resolved once on abort so an in-flight send returns immediately rather
+        // than blocking up to the full timeout during shutdown.
+        let abortResolve: () => void = () => {};
+        const abortPromise = new Promise<'abort'>((resolve) => { abortResolve = () => resolve('abort'); });
+        const onAbort = () => {
+            try { wt.close(); } catch { /* ignore */ }
+            abortResolve();
+        };
+        stopSignal.addEventListener('abort', onAbort);
+
+        // Persistent receiver: the only reader of the datagram stream. Decodes the
+        // seq prefix of each echo and resolves the matching waiter (if its sender
+        // has not already timed out). Never abandoned, so no read piles up.
+        const receiveLoop = (async () => {
+            try {
+                while (true) {
+                    const { value, done } = await reader.read();
+                    if (done) break;
+                    if (!value || value.byteLength < 4) continue;
+                    const seq = new DataView(value.buffer, value.byteOffset, value.byteLength).getUint32(0, false);
+                    const resolve = waiters.get(seq);
+                    if (resolve) {
+                        waiters.delete(seq);
+                        resolve(performance.now());
+                    }
+                    // else: a late echo whose waiter already timed out — drop it.
+                }
+            } catch {
+                // Reader closed on abort / connection end — normal shutdown.
+            }
+        })();
+
+        try {
+            let seq = 0;
+            while (!stopSignal.aborted) {
+                seq++;
+                // [4-byte big-endian seq | makePayload bytes]
+                const body = encoder.encode(makePayload(this.clientId, Date.now()));
+                const frame = new Uint8Array(4 + body.byteLength);
+                new DataView(frame.buffer).setUint32(0, seq, false);
+                frame.set(body, 4);
+
+                const sendStart = performance.now();
+                let timer: number | undefined;
+                const arrival = new Promise<number>((resolve) => waiters.set(seq, resolve));
+                const timeout = new Promise<'timeout'>((resolve) => {
+                    timer = setTimeout(() => resolve('timeout'), DATAGRAM_RECV_TIMEOUT_MS);
+                });
+
+                try {
+                    await writer.write(frame);
+                } catch {
+                    waiters.delete(seq);
+                    clearTimeout(timer);
+                    if (!stopSignal.aborted) stats.errors++;
+                    break;
+                }
+
+                const result = await Promise.race([arrival, timeout, abortPromise]);
+                clearTimeout(timer);
+                if (result === 'abort') {
+                    waiters.delete(seq);
+                    break;
+                }
+                if (result === 'timeout') {
+                    waiters.delete(seq);
+                    stats.errors++;   // datagram lost (request or echo dropped)
+                } else {
+                    stats.rtts.push(result - sendStart);
+                    stats.echoesOk++;
+                }
+            }
+        } finally {
+            stopSignal.removeEventListener('abort', onAbort);
+            try { wt.close(); } catch { /* ignore */ }
+            try { writer.releaseLock(); } catch { /* ignore */ }
+            await receiveLoop.catch(() => { /* ignore */ });
+        }
+
+        return stats;
+    }
+}
+
+// ============================================================================
 // Client factory
 // ============================================================================
 
@@ -610,6 +784,7 @@ function makeClient(protocol: Protocol, target: string, clientId: number, certHa
         case 'short-polling':  return new ShortPollingClient(target, clientId);
         case 'long-polling':   return new LongPollingClient(target, clientId);
         case 'webtransport':   return new WebTransportClient(target, clientId, certHash!);
+        case 'webtransport-datagram': return new WebTransportDatagramClient(target, clientId, certHash!);
     }
 }
 
@@ -698,11 +873,20 @@ async function main(): Promise<void> {
     // these timeout/WebTransport rejections here; anything else is re-thrown so
     // real bugs still crash loudly. This is pure robustness — it does not touch
     // the echo loop, pipeline depth, or stream handling.
+    // Under packet loss the QUIC layer also tears connections down mid-handshake
+    // and mid-run as PLAIN Error objects (name "Error"), not WebTransportError —
+    // e.g. "reset by peer", "connection reset/closed/lost". Those slip past a
+    // name === 'WebTransportError' check and crash the process, so match them by
+    // message too. A genuine logic bug (TypeError/ReferenceError/…) won't contain
+    // these connection-teardown phrases, so it still surfaces and crashes loudly.
     globalThis.addEventListener('unhandledrejection', (e: PromiseRejectionEvent) => {
         const r = e.reason;
         const name = r?.name ?? '';
         const msg = String(r?.message ?? r ?? '');
-        if (name === 'WebTransportError' || /timed out/i.test(msg)) {
+        if (
+            name === 'WebTransportError' ||
+            /timed out|reset by (peer|remote)|(connection|stream) (reset|closed|lost|aborted)|aborted by (peer|remote)/i.test(msg)
+        ) {
             e.preventDefault();
         }
     });
@@ -712,7 +896,7 @@ async function main(): Promise<void> {
     console.log(`[load_generator] protocol=${args.protocol} target=${args.target} clients=${args.clients} duration=${args.duration}s`);
 
     let certHash: ArrayBuffer | undefined;
-    if (args.protocol === 'webtransport') {
+    if (args.protocol === 'webtransport' || args.protocol === 'webtransport-datagram') {
         const certPath = new URL('../servers/cert.pem', import.meta.url);
         const certPem = await Deno.readTextFile(certPath);
         certHash = await crypto.subtle.digest('SHA-256', decodePemToDer(certPem).buffer as ArrayBuffer);

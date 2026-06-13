@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
-# sweep_benchmark.sh — Full thesis sweep: 3 network profiles x 15 runtime+protocol
-# combos = 45 timed runs. Driver: loops the matrix and calls the core harness
+# sweep_benchmark.sh — Full thesis sweep: 3 network profiles x 18 runtime+protocol
+# combos = 54 timed runs. Driver: loops the matrix and calls the core harness
 # (harness_run_test.sh) once per combination.
 #
 # Per-profile output is routed to results/<profile>/metrics.csv. Each run is
@@ -56,9 +56,15 @@ run_one_benchmark() {
     local server_cmd
     server_cmd=$(server_cmd_for "$runtime" "$proto")
 
+    # Reliable webtransport-* variants share the --protocol webtransport client;
+    # webtransport-datagram selects the unreliable datagram client.
     local client_proto="$proto"
     local wt_flag=""
-    [[ "$proto" == webtransport* ]] && client_proto="webtransport" && wt_flag="--unstable-net"
+    if [[ "$proto" == "webtransport-datagram" ]]; then
+        client_proto="webtransport-datagram"; wt_flag="--unstable-net"
+    elif [[ "$proto" == webtransport* ]]; then
+        client_proto="webtransport"; wt_flag="--unstable-net"
+    fi
 
     local client_cmd="deno run --allow-net --allow-read --allow-write --allow-env --unsafely-ignore-certificate-errors $wt_flag \
         $CLIENT_SCRIPT \
@@ -94,7 +100,7 @@ run_one_benchmark() {
 # Use ports starting at 8200 to avoid TIME_WAIT collision with smoke (8080–8095).
 BENCHMARK_BASE_PORT=8200
 
-yellow "[bench] Starting full sweep: ${#PROFILE_NAMES[@]} profiles x 15 combos = 45 runs"
+yellow "[bench] Starting full sweep: ${#PROFILE_NAMES[@]} profiles x 18 combos = 54 runs"
 yellow "[bench] duration=${DURATION}s  clients=${CLIENTS}  server_cores=${SERVER_CORES}  client_cores=${CLIENT_CORES}"
 echo ""
 

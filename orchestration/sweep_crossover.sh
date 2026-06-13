@@ -47,10 +47,12 @@ LOSS_LEVELS=("0%" "1%" "2%" "5%" "10%")
 # The crossover thesis compares kernel-TCP WebSocket against QUIC WebTransport.
 # The SSE / polling protocols are not part of that comparison and tripled the
 # sweep runtime, so they are excluded here (chart 7 filters to WS+WT anyway).
-# Each runtime keeps its own WebTransport variant.
-PROTOS_CROSSOVER_NODE=(ws webtransport-fails-components)
-PROTOS_CROSSOVER_BUN=(ws webtransport-vmeansdev)
-PROTOS_CROSSOVER_DENO=(ws webtransport)
+# Each runtime keeps its own reliable WebTransport variant, plus the unreliable
+# webtransport-datagram variant — the datagram line is the whole point of the
+# crossover chart (it should hold up as loss rises while WS and reliable WT collapse).
+PROTOS_CROSSOVER_NODE=(ws webtransport-fails-components webtransport-datagram)
+PROTOS_CROSSOVER_BUN=(ws webtransport-vmeansdev webtransport-datagram)
+PROTOS_CROSSOVER_DENO=(ws webtransport webtransport-datagram)
 
 # --- Pre-flight ---------------------------------------------------------------
 run_preflight
@@ -66,9 +68,15 @@ run_one_crossover() {
     local server_cmd
     server_cmd=$(server_cmd_for "$runtime" "$proto")
 
+    # Reliable webtransport-* variants share the --protocol webtransport client;
+    # webtransport-datagram selects the unreliable datagram client.
     local client_proto="$proto"
     local wt_flag=""
-    [[ "$proto" == webtransport* ]] && client_proto="webtransport" && wt_flag="--unstable-net"
+    if [[ "$proto" == "webtransport-datagram" ]]; then
+        client_proto="webtransport-datagram"; wt_flag="--unstable-net"
+    elif [[ "$proto" == webtransport* ]]; then
+        client_proto="webtransport"; wt_flag="--unstable-net"
+    fi
 
     local client_cmd="deno run --allow-net --allow-read --allow-write --allow-env --unsafely-ignore-certificate-errors $wt_flag \
         $CLIENT_SCRIPT \

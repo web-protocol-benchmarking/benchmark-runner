@@ -52,9 +52,12 @@ PROTO_LABELS: dict[str, str] = {
     "sse": "SSE",
     "short-polling": "Short-Polling",
     "long-polling": "Long-Polling",
-    "webtransport": "WebTransport",
-    "webtransport-vmeansdev": "WebTransport",
-    "webtransport-fails-components": "WebTransport",
+    "webtransport": "WebTransport (Stream)",
+    "webtransport-vmeansdev": "WebTransport (Stream)",
+    "webtransport-fails-components": "WebTransport (Stream)",
+    # Unreliable QUIC-datagram variant — DISTINCT label so it never merges into,
+    # double-counts, or displaces the reliable "WebTransport (Stream)" series.
+    "webtransport-datagram": "WebTransport (Datagram)",
 }
 RUNTIME_LABELS: dict[str, str] = {"node": "Node", "deno": "Deno", "bun": "Bun"}
 
@@ -68,7 +71,8 @@ PROTO_ORDER = [
     "SSE",
     "Short-Polling",
     "Long-Polling",
-    "WebTransport",
+    "WebTransport (Stream)",
+    "WebTransport (Datagram)",
 ]
 
 # ---------------------------------------------------------------------------
@@ -424,9 +428,10 @@ def chart_crossover(df: pd.DataFrame, out_dir: Path) -> None:
     cross["PacketLossPct"] = pd.to_numeric(cross["PacketLossPct"], errors="coerce")
     cross = cross[cross["PacketLossPct"].notna()].copy()
 
-    # The crossover thesis is strictly WebSocket (TCP) vs WebTransport (QUIC);
-    # the polling/SSE protocols only clutter the chart and bury the comparison.
-    cross = cross[cross["ProtoLabel"].isin(["WebSocket", "WebTransport"])].copy()
+    # The crossover thesis is strictly WebSocket (TCP) vs WebTransport (QUIC,
+    # reliable stream + unreliable datagram); the polling/SSE protocols only
+    # clutter the chart and bury the comparison.
+    cross = cross[cross["ProtoLabel"].isin(["WebSocket", "WebTransport (Stream)", "WebTransport (Datagram)"])].copy()
     if cross.empty:
         print("  [warn] no usable WS/WebTransport crossover rows — skipping chart 7")
         return
@@ -444,7 +449,7 @@ def chart_crossover(df: pd.DataFrame, out_dir: Path) -> None:
 
     # Explicit draw/legend order: protocol-major, runtime-minor (Bun, Deno, Node).
     present_series = set(grouped["Series"])
-    proto_classes = [p for p in ["WebSocket", "WebTransport"] if p in set(grouped["ProtoLabel"])]
+    proto_classes = [p for p in ["WebSocket", "WebTransport (Stream)", "WebTransport (Datagram)"] if p in set(grouped["ProtoLabel"])]
     series_order = [
         f"{rt} {proto}"
         for proto in proto_classes
@@ -453,23 +458,33 @@ def chart_crossover(df: pd.DataFrame, out_dir: Path) -> None:
     ]
 
     # WebSocket lines dashed (the TCP baseline that should collapse);
-    # WebTransport lines solid + thicker (the QUIC contender that should hold up).
+    # reliable WebTransport lines solid + thicker (the QUIC contender);
+    # datagram WebTransport lines dotted + thicker (unreliable QUIC — should hold
+    # up best under loss). Color still encodes runtime.
+    STYLE = {
+        "WebSocket":               {"linestyle": "--", "linewidth": 1.6, "marker": "x", "markersize": 5, "alpha": 0.7},
+        "WebTransport (Stream)":   {"linestyle": "-",  "linewidth": 2.6, "marker": "o", "markersize": 6, "alpha": 1.0},
+        "WebTransport (Datagram)": {"linestyle": ":",  "linewidth": 2.6, "marker": "s", "markersize": 6, "alpha": 1.0},
+    }
+    # Legend wording: "<Runtime> WS" / "<Runtime> WT Stream (<impl>)" /
+    # "<Runtime> WT Datagram (<impl>)", where <impl> is the per-runtime backend.
+    pkg_by_runtime = {"Bun": "vmeansdev", "Deno": "native", "Node": "fails-components"}
+    def legend_for(runtime: str, proto: str) -> str:
+        if proto == "WebSocket":
+            return f"{runtime} WS"
+        kind = "Datagram" if "Datagram" in proto else "Stream"
+        return f"{runtime} WT {kind} ({pkg_by_runtime.get(runtime, '?')})"
     for series in series_order:
         g = grouped[grouped["Series"] == series].sort_values("PacketLossPct")
         runtime = g["RuntimeLabel"].iloc[0]
         proto = g["ProtoLabel"].iloc[0]
         color = RUNTIME_PALETTE.get(runtime, "#888888")
-        is_wt = proto == "WebTransport"
         ax.plot(
             g["PacketLossPct"],
             g["Throughput"],
-            label=series,
+            label=legend_for(runtime, proto),
             color=color,
-            linestyle="-" if is_wt else "--",
-            linewidth=2.6 if is_wt else 1.6,
-            marker="o" if is_wt else "x",
-            markersize=6 if is_wt else 5,
-            alpha=1.0 if is_wt else 0.7,
+            **STYLE.get(proto, STYLE["WebSocket"]),
         )
 
     # Linear y-axis: at depth-1 with 50ms latency the closed-loop throughput is
@@ -484,7 +499,7 @@ def chart_crossover(df: pd.DataFrame, out_dir: Path) -> None:
     ax.set_xticklabels([f"{int(v) if v == int(v) else v}%" for v in loss_ticks])
     ax.set_title(
         "Crossover — Throughput vs Packet Loss at 50ms Latency\n"
-        "(dashed = WebSocket / TCP, solid = WebTransport / QUIC)",
+        "(dashed = WebSocket / TCP, solid = WebTransport / QUIC stream, dotted = WebTransport / QUIC datagram)",
         fontsize=13, fontweight="bold",
     )
     ax.set_xlabel("Packet Loss (%)", fontsize=12)
@@ -515,7 +530,7 @@ def chart_crossover(df: pd.DataFrame, out_dir: Path) -> None:
 
 
 def chart_packet_loss_resilience(df: pd.DataFrame, out_dir: Path) -> None:
-    wt_variants = {"webtransport", "webtransport-vmeansdev", "webtransport-fails-components"}
+    wt_variants = {"webtransport", "webtransport-vmeansdev", "webtransport-fails-components", "webtransport-datagram"}
     target_variants = {"ws"} | wt_variants
     target_profiles = {"ideal", "packet_loss"}
 
@@ -589,14 +604,18 @@ def chart_packet_loss_resilience(df: pd.DataFrame, out_dir: Path) -> None:
 #   WebTransport FC  — solid  (-),   alpha=1.0, lw=2.4   (primary comparison)
 #   WT vmeansdev     — dash-dot (-.), alpha=1.0, lw=2.4   (distinct Bun WT variant)
 CDF_RUNS = [
-    # Ordered Bun, Deno, Node within each protocol class (WS then WebTransport).
-    # runtime                 variant                         label                              color      ls     lw    alpha
-    ("bun",  "ws",                            "Bun WS (baseline)",               "#F472B6", "--",  1.8,  0.6),
-    ("deno", "ws",                            "Deno WS (baseline)",              "#1A1A1A", "--",  1.8,  0.6),
-    ("node", "ws",                            "Node WS (baseline)",              "#339933", "--",  1.8,  0.6),
-    ("bun",  "webtransport-vmeansdev",        "Bun WebTransport (vmeansdev)",     "#F472B6", "-",   2.4,  1.0),
-    ("deno", "webtransport",                  "Deno WebTransport (native)",       "#1A1A1A", "-",   2.4,  1.0),
-    ("node", "webtransport-fails-components", "Node WebTransport (fails-components)",           "#339933", "-",   2.4,  1.0),
+    # Ordered Bun, Deno, Node within each protocol class (WS, WT Stream, WT Datagram).
+    # runtime                 variant                         label                                 color      ls     lw    alpha
+    ("bun",  "ws",                            "Bun WS",                             "#F472B6", "--",  1.8,  0.6),
+    ("deno", "ws",                            "Deno WS",                            "#1A1A1A", "--",  1.8,  0.6),
+    ("node", "ws",                            "Node WS",                            "#339933", "--",  1.8,  0.6),
+    ("bun",  "webtransport-vmeansdev",        "Bun WT Stream (vmeansdev)",          "#F472B6", "-",   2.4,  1.0),
+    ("deno", "webtransport",                  "Deno WT Stream (native)",            "#1A1A1A", "-",   2.4,  1.0),
+    ("node", "webtransport-fails-components", "Node WT Stream (fails-components)",  "#339933", "-",   2.4,  1.0),
+    # Unreliable datagram variant (dotted), one per runtime.
+    ("bun",  "webtransport-datagram",         "Bun WT Datagram (vmeansdev)",        "#F472B6", ":",   2.4,  1.0),
+    ("deno", "webtransport-datagram",         "Deno WT Datagram (native)",          "#1A1A1A", ":",   2.4,  1.0),
+    ("node", "webtransport-datagram",         "Node WT Datagram (fails-components)","#339933", ":",   2.4,  1.0),
 ]
 
 _RNG = np.random.default_rng(42)
@@ -676,13 +695,13 @@ def chart_latency_cdf(out_dir: Path) -> None:
     ax.set_ylabel("Cumulative Probability", fontsize=12)
     ax.set_ylim(0, 1.02)
     ax.set_xlim(0, _CDF_XLIM_MS)
-    # Two-section legend: WebTransport entries first (solid/dash-dot), then WS baselines
+    # Two-section legend: WebTransport entries first (solid/dotted), then WS
     handles, labels = ax.get_legend_handles_labels()
-    wt_idx = [i for i, l in enumerate(labels) if "WebTransport" in l]
+    wt_idx = [i for i, l in enumerate(labels) if "WT " in l]
     ws_idx = [i for i, l in enumerate(labels) if "WS" in l]
     ordered_h = [handles[i] for i in wt_idx + ws_idx]
     ordered_l = [labels[i]  for i in wt_idx + ws_idx]
-    ax.legend(ordered_h, ordered_l, fontsize=9, title="Protocol (dashed = WebSocket baseline)")
+    ax.legend(ordered_h, ordered_l, fontsize=9, title="Protocol (dashed = WebSocket)")
     ax.grid(linestyle="--", alpha=0.4)
     plt.tight_layout()
     out_path = out_dir / "chart3_latency_cdf.png"
@@ -701,13 +720,17 @@ def chart_latency_cdf(out_dir: Path) -> None:
 # Each entry: (runtime, variant, label, color, linestyle, linewidth, alpha)
 # Mirrors CDF chart styling: WebSocket = dashed/low-opacity, WT FC = solid, WT vmeansdev = dash-dot
 CPU_RUNS = [
-    # Ordered Bun, Deno, Node within each protocol class (WS then WebTransport).
-    ("bun",  "ws",                            "Bun WS (baseline)",               "#F472B6", "--", 1.5, 0.6),
-    ("deno", "ws",                            "Deno WS (baseline)",              "#1A1A1A", "--", 1.5, 0.6),
-    ("node", "ws",                            "Node WS (baseline)",              "#339933", "--", 1.5, 0.6),
-    ("bun",  "webtransport-vmeansdev",        "Bun WebTransport (vmeansdev)",     "#F472B6", "-",  2.0, 1.0),
-    ("deno", "webtransport",                  "Deno WebTransport (native)",       "#1A1A1A", "-",  2.0, 1.0),
-    ("node", "webtransport-fails-components", "Node WebTransport (fails-components)",           "#339933", "-",  2.0, 1.0),
+    # Ordered Bun, Deno, Node within each protocol class (WS, WT Stream, WT Datagram).
+    ("bun",  "ws",                            "Bun WS",                             "#F472B6", "--", 1.5, 0.6),
+    ("deno", "ws",                            "Deno WS",                            "#1A1A1A", "--", 1.5, 0.6),
+    ("node", "ws",                            "Node WS",                            "#339933", "--", 1.5, 0.6),
+    ("bun",  "webtransport-vmeansdev",        "Bun WT Stream (vmeansdev)",          "#F472B6", "-",  2.0, 1.0),
+    ("deno", "webtransport",                  "Deno WT Stream (native)",            "#1A1A1A", "-",  2.0, 1.0),
+    ("node", "webtransport-fails-components", "Node WT Stream (fails-components)",  "#339933", "-",  2.0, 1.0),
+    # Unreliable datagram variant (dotted), one per runtime.
+    ("bun",  "webtransport-datagram",         "Bun WT Datagram (vmeansdev)",        "#F472B6", ":",  2.0, 1.0),
+    ("deno", "webtransport-datagram",         "Deno WT Datagram (native)",          "#1A1A1A", ":",  2.0, 1.0),
+    ("node", "webtransport-datagram",         "Node WT Datagram (fails-components)","#339933", ":",  2.0, 1.0),
 ]
 
 

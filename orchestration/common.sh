@@ -16,9 +16,9 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # --- Matrix variables ---------------------------------------------------------
 RUNTIMES=(node deno bun)
-PROTOCOLS_NODE=(ws sse short-polling long-polling webtransport-fails-components)
-PROTOCOLS_BUN=(ws sse short-polling long-polling webtransport-vmeansdev)
-PROTOCOLS_DENO=(ws sse short-polling long-polling webtransport)
+PROTOCOLS_NODE=(ws sse short-polling long-polling webtransport-fails-components webtransport-datagram)
+PROTOCOLS_BUN=(ws sse short-polling long-polling webtransport-vmeansdev webtransport-datagram)
+PROTOCOLS_DENO=(ws sse short-polling long-polling webtransport webtransport-datagram)
 BASE_PORT=8080
 
 # --- Color / UI helpers -------------------------------------------------------
@@ -38,6 +38,7 @@ proto_to_base() {
         webtransport)                  echo "webtransport" ;;
         webtransport-fails-components) echo "webtransport-fails-components" ;;
         webtransport-vmeansdev)        echo "webtransport-vmeansdev" ;;
+        webtransport-datagram)         echo "webtransport-datagram" ;;
     esac
 }
 
@@ -61,7 +62,8 @@ server_cmd_for() {
     case "$runtime" in
         node) echo "node $REPO_ROOT/servers/node/$base.js" ;;
         deno)
-            if [[ "$proto" == "webtransport" ]]; then
+            if [[ "$proto" == "webtransport" || "$proto" == "webtransport-datagram" ]]; then
+                # Native QUIC (Deno.QuicEndpoint) — reliable streams and datagrams both need --unstable-net.
                 echo "deno run --allow-net --allow-env --allow-read --unstable-net $REPO_ROOT/servers/deno/$base.ts"
             elif [[ "$proto" == "webtransport-fails-components" ]]; then
                 echo "deno run --allow-net --allow-env --allow-read --allow-ffi $REPO_ROOT/servers/deno/$base.ts"
