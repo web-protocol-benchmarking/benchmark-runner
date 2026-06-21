@@ -143,6 +143,50 @@ PIDSTAT_PID=""
 CLIENT_PIDSTAT_PID=""
 CLIENT_RC=""
 
+# --- netem ground-truth capture -----------------------------------------------
+# tc netem keeps per-qdisc counters of how many packets it actually sent vs.
+# dropped. Capturing `tc -s qdisc show` before teardown lets us confirm the
+# *observed* loss matches the *configured* loss — the requested rate is all the
+# kernel records (per-packet drop timing is not exposed, so netem's default
+# independent/Bernoulli model can be confirmed in aggregate rate only). Globals
+# below feed write_metadata; default 0 when capture never ran (early failure).
+NETEM_SERVER_SENT=0;  NETEM_SERVER_DROPPED=0
+NETEM_CLIENT_SENT=0;  NETEM_CLIENT_DROPPED=0
+# Observed loss% as a printf-ready string (kept as text so write_metadata can
+# emit it verbatim without re-running awk).
+observed_loss_pct() {  # $1=sent $2=dropped
+    awk -v s="$1" -v d="$2" \
+        'BEGIN { t = s + d; if (t > 0) printf "%.2f", (d / t) * 100; else printf "0" }'
+}
+capture_netem_stats() {
+    [[ -z "${RUN_DIR:-}" || ! -d "$RUN_DIR" ]] && return 0
+    local ns dev out line
+    for spec in "$NS_SERVER:$VETH_SERVER:netem_server.txt:SERVER" \
+                "$NS_CLIENT:$VETH_CLIENT:netem_client.txt:CLIENT"; do
+        IFS=: read -r ns dev out side <<<"$spec"
+        ip netns exec "$ns" tc -s qdisc show dev "$dev" \
+            > "$RUN_DIR/$out" 2>/dev/null || true
+        # Parse: " Sent <bytes> bytes <pkt> pkt (dropped <N>, overlimits ..."
+        line=$(awk '
+            /Sent/ {
+                sent = 0; dropped = 0
+                for (i = 1; i <= NF; i++) {
+                    if ($i == "pkt")              sent    = $(i-1) + 0
+                    if ($i ~ /^\(dropped$/)       dropped = $(i+1) + 0
+                }
+                printf "%d %d", sent, dropped; exit
+            }' "$RUN_DIR/$out" 2>/dev/null)
+        local sent="${line%% *}" dropped="${line##* }"
+        [[ -z "$sent"    || ! "$sent"    =~ ^[0-9]+$ ]] && sent=0
+        [[ -z "$dropped" || ! "$dropped" =~ ^[0-9]+$ ]] && dropped=0
+        eval "NETEM_${side}_SENT=$sent; NETEM_${side}_DROPPED=$dropped"
+    done
+    local s_loss c_loss
+    s_loss=$(observed_loss_pct "$NETEM_SERVER_SENT" "$NETEM_SERVER_DROPPED")
+    c_loss=$(observed_loss_pct "$NETEM_CLIENT_SENT" "$NETEM_CLIENT_DROPPED")
+    echo "[netem] observed loss: server=${s_loss}% (${NETEM_SERVER_DROPPED}/$((NETEM_SERVER_SENT + NETEM_SERVER_DROPPED))) client=${c_loss}% (${NETEM_CLIENT_DROPPED}/$((NETEM_CLIENT_SENT + NETEM_CLIENT_DROPPED))) | configured=${LOSS} delay=${DELAY}" >&2
+}
+
 # --- metadata.json writer -----------------------------------------------------
 # Self-describing dimension+path index for each run (replaces the old
 # annotations.csv + chronological-zip linkage). Written by the cleanup trap so
@@ -167,6 +211,16 @@ write_metadata() {
   \"protocol_variant\": \"${TAG_VARIANT}\",
   \"packet_loss_pct\": ${LOSS_PCT:-0},
   \"delay_ms\": ${DELAY_MS:-0},
+  \"netem\": {
+    \"configured_loss\": \"${LOSS}\",
+    \"configured_delay\": \"${DELAY}\",
+    \"server_sent_pkt\": ${NETEM_SERVER_SENT:-0},
+    \"server_dropped_pkt\": ${NETEM_SERVER_DROPPED:-0},
+    \"server_observed_loss_pct\": $(observed_loss_pct "${NETEM_SERVER_SENT:-0}" "${NETEM_SERVER_DROPPED:-0}"),
+    \"client_sent_pkt\": ${NETEM_CLIENT_SENT:-0},
+    \"client_dropped_pkt\": ${NETEM_CLIENT_DROPPED:-0},
+    \"client_observed_loss_pct\": $(observed_loss_pct "${NETEM_CLIENT_SENT:-0}" "${NETEM_CLIENT_DROPPED:-0}")
+  },
   \"duration_sec\": ${DURATION},
   \"concurrency\": ${RUN_CONCURRENCY:-0},
   \"server_port\": ${SERVER_PORT},
@@ -181,6 +235,8 @@ write_metadata() {
     \"server_pidstat\": \"server_pidstat.log\",
     \"client_pidstat\": \"client_pidstat.log\",
     \"rtts\": \"rtts.csv\",
+    \"netem_server\": \"netem_server.txt\",
+    \"netem_client\": \"netem_client.txt\",
     \"perf_data\": ${perf_json},
     \"flamegraph\": ${flame_json}
   }
@@ -200,6 +256,12 @@ cleanup() {
     # SIGTERM and flushed perf.data, so the flamegraph pipeline below sees a
     # complete capture.
     wait 2>/dev/null
+
+    # --- netem ground-truth capture (before namespaces are torn down) --------
+    # Runs while ns_server/ns_client still exist and the load has stopped, so
+    # the qdisc counters reflect the whole run. Populates the NETEM_* globals
+    # that write_metadata emits below.
+    capture_netem_stats
 
     # --- Flamegraph generation (profiling runs only) -------------------------
     if [[ "${PROFILE:-0}" -eq 1 && -f "${PERF_DATA:-}" ]]; then
