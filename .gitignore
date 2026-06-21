@@ -1,5 +1,6 @@
 .claude
 .venv
+logs/
 node_modules/
 results/
 servers/*.pem
