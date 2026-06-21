@@ -24,8 +24,11 @@ Deno.serve({ hostname: host, port, cert, key }, (req) => {
         return new Response('expected websocket upgrade', { status: 426 });
     }
 
-    const { socket, response } = Deno.upgradeWebSocket(req);
+    // Read request headers BEFORE upgrading: as of Deno 2.8, upgradeWebSocket()
+    // consumes the request, so touching req.headers afterwards throws
+    // "Request closed" and the upgrade response is never returned.
     const peer = req.headers.get('x-forwarded-for') ?? 'peer';
+    const { socket, response } = Deno.upgradeWebSocket(req);
 
     socket.onopen = () => console.log(`conn open ${peer}`);
     socket.onmessage = (ev) => {
