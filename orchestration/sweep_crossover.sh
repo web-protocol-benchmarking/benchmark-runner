@@ -29,7 +29,7 @@ RESULTS_BASE="$REPO_ROOT/results"
 CROSSOVER_DIR="$RESULTS_BASE/crossover"
 
 # --- Benchmark parameters -----------------------------------------------------
-DURATION=30
+DURATION=20
 CLIENTS=50
 SERVER_CORES="0"
 CLIENT_CORES="1,2"
