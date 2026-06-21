@@ -81,7 +81,17 @@ PROTO_ORDER = [
 
 
 def load_all() -> pd.DataFrame:
-    """Load the self-describing metrics.csv from each profile (no annotations)."""
+    """Load the self-describing metrics.csv from each profile and AVERAGE every
+    repeated run of the same combination.
+
+    Run the sweeps N times (see run_all_sweeps.sh) and each returned row is the
+    mean across all runs of that
+    (Profile, Runtime, ProtocolVariant, PacketLossPct, DelayMs) combination,
+    with a NumRuns column recording how many runs were averaged. This replaces
+    the former latest-run-wins dedup so a single noisy run no longer defines a
+    bar — but it means results/ must contain runs from only ONE runtime version
+    (run_all_sweeps.sh archives stale results before a fresh sweep set).
+    """
     frames: list[pd.DataFrame] = []
     for profile in PROFILES:
         metrics_path = RESULTS_BASE / profile / "metrics.csv"
@@ -98,39 +108,50 @@ def load_all() -> pd.DataFrame:
         print("No benchmark data found. Run orchestration/sweep_benchmark.sh first.")
         sys.exit(1)
 
-    result = pd.concat(frames, ignore_index=True)
+    raw = pd.concat(frames, ignore_index=True)
 
-    # Latest-run-wins: if results/ holds repeated runs of the same combination
-    # (a sweep re-run without clearing), keep only the most recent row per combo
-    # so the metrics-based charts agree with the raw CDF/CPU charts (which use
-    # build_run_dir_map's latest-by-timestamp_start dir).
-    if "Timestamp" in result.columns:
-        dedup_keys = [k for k in
-                      ["Profile", "Runtime", "ProtocolVariant", "PacketLossPct", "DelayMs"]
-                      if k in result.columns]
-        result = (
-            result.sort_values("Timestamp")
-            .drop_duplicates(subset=dedup_keys, keep="last")
-            .reset_index(drop=True)
-        )
+    # Average across ALL runs of each combination. Group on the self-describing
+    # key columns; mean the numeric metrics (blank MeanConnect_ms -> NaN, which
+    # mean() skips); carry one representative value for descriptive columns.
+    key_cols = [k for k in
+                ["Profile", "Runtime", "ProtocolVariant", "PacketLossPct", "DelayMs"]
+                if k in raw.columns]
+    if key_cols:
+        numeric_cols = [c for c in
+                        ["Throughput", "p50_ms", "p95_ms", "p99_ms", "Errors",
+                         "Overflows", "MeanConnect_ms", "Concurrency", "DurationSec"]
+                        if c in raw.columns]
+        for c in numeric_cols:
+            raw[c] = pd.to_numeric(raw[c], errors="coerce")
+        passthrough = [c for c in raw.columns
+                       if c not in key_cols + numeric_cols + ["Timestamp"]]
+        agg = {c: "mean" for c in numeric_cols}
+        agg.update({c: "first" for c in passthrough})
+        result = raw.groupby(key_cols, as_index=False, dropna=False).agg(agg)
+        counts = (raw.groupby(key_cols, dropna=False)
+                  .size().reset_index(name="NumRuns"))
+        result = result.merge(counts, on=key_cols, how="left")
+    else:
+        result = raw
 
     result["RuntimeLabel"] = result["Runtime"].map(RUNTIME_LABELS)
     result["ProtoLabel"] = result["ProtocolVariant"].map(PROTO_LABELS)
     return result
 
 
-def build_run_dir_map(profile: str) -> dict[tuple[str, str], Path]:
+def build_run_dir_map(profile: str) -> dict[tuple[str, str], list[Path]]:
     """
-    Map (runtime, protocol_variant) -> run directory, read explicitly from each
-    run's metadata.json. Order-independent — no chronological zip. On duplicate
-    keys (re-runs) keep the latest by timestamp_start; skip failed runs
-    (client_rc != 0).
+    Map (runtime, protocol_variant) -> LIST of every successful run directory
+    for that combination, read explicitly from each run's metadata.json and
+    sorted by timestamp_start. Order-independent — no chronological zip. Skips
+    failed runs (client_rc != 0). The raw-data charts (CDF, CPU-over-time,
+    CPU-efficiency) average across all dirs in each list.
     """
     profile_dir = RESULTS_BASE / profile
     if not profile_dir.exists():
         return {}
 
-    chosen: dict[tuple[str, str], tuple[str, Path]] = {}
+    collected: dict[tuple[str, str], list[tuple[str, Path]]] = {}
     for meta_path in profile_dir.glob("*/metadata.json"):
         try:
             meta = json.loads(meta_path.read_text())
@@ -141,10 +162,8 @@ def build_run_dir_map(profile: str) -> dict[tuple[str, str], Path]:
             continue
         key = (meta.get("runtime"), meta.get("protocol_variant"))
         ts = str(meta.get("timestamp_start", ""))
-        prev = chosen.get(key)
-        if prev is None or ts > prev[0]:
-            chosen[key] = (ts, meta_path.parent)
-    return {k: v[1] for k, v in chosen.items()}
+        collected.setdefault(key, []).append((ts, meta_path.parent))
+    return {k: [p for _, p in sorted(v)] for k, v in collected.items()}
 
 
 def write_chart_csv(data, out_dir: Path, stem: str) -> None:
@@ -330,28 +349,34 @@ def chart_cpu_efficiency(df: pd.DataFrame, out_dir: Path) -> None:
     records: list[dict] = []
     for _, row in ideal.iterrows():
         key = (row["Runtime"], row["ProtocolVariant"])
-        run_dir = run_map.get(key)
-        if run_dir is None:
+        run_dirs = run_map.get(key)
+        if not run_dirs:
             print(f"  [warn] chart 6: no run dir for {key} — skipping")
             continue
 
-        pidstat_path = run_dir / "server_pidstat.log"
-        if not pidstat_path.exists():
-            print(f"  [warn] chart 6: {pidstat_path} not found — skipping {key}")
+        # Average server CPU across every run of this combination: take each
+        # run's mean %CPU, then average those per-run means.
+        per_run_cpu: list[float] = []
+        for run_dir in run_dirs:
+            pidstat_path = run_dir / "server_pidstat.log"
+            if not pidstat_path.exists():
+                continue
+            cpu_vals = parse_pidstat(pidstat_path)
+            if cpu_vals:
+                per_run_cpu.append(sum(cpu_vals) / len(cpu_vals))
+
+        if not per_run_cpu:
+            print(f"  [warn] chart 6: no CPU samples for {key} — skipping")
             continue
 
-        cpu_vals = parse_pidstat(pidstat_path)
-        if not cpu_vals:
-            print(f"  [warn] chart 6: no CPU samples in {pidstat_path} — skipping {key}")
-            continue
-
-        avg_cpu = sum(cpu_vals) / len(cpu_vals)
+        avg_cpu = sum(per_run_cpu) / len(per_run_cpu)
         # Guard division by zero: a server pinned to one core that never
         # registered load gives avg_cpu == 0 — efficiency is undefined.
         if avg_cpu <= 0:
             print(f"  [warn] chart 6: avg CPU is {avg_cpu} for {key} — skipping (div-by-zero)")
             continue
 
+        # row["Throughput"] is already the mean across runs (from load_all).
         records.append({
             "RuntimeLabel": row["RuntimeLabel"],
             "ProtoLabel": row["ProtoLabel"],
@@ -359,6 +384,7 @@ def chart_cpu_efficiency(df: pd.DataFrame, out_dir: Path) -> None:
             "Throughput": row["Throughput"],
             "AvgServerCPUPct": avg_cpu,
             "Efficiency": row["Throughput"] / avg_cpu,
+            "NumCPURuns": len(per_run_cpu),
         })
 
     if not records:
@@ -397,7 +423,7 @@ def chart_cpu_efficiency(df: pd.DataFrame, out_dir: Path) -> None:
     print(f"  wrote {out_path}")
 
     csv_df = (
-        eff[["RuntimeLabel", "ProtocolVariant", "Throughput", "AvgServerCPUPct", "Efficiency"]]
+        eff[["RuntimeLabel", "ProtocolVariant", "Throughput", "AvgServerCPUPct", "Efficiency", "NumCPURuns"]]
         .rename(columns={
             "RuntimeLabel": "Runtime",
             "Throughput": "Throughput_msg_s",
@@ -620,9 +646,7 @@ CDF_RUNS = [
 
 _RNG = np.random.default_rng(42)
 _MAX_RTT_SAMPLES = 200_000
-# Hard x-axis cap in ms: p99 of the worst run (Deno WT) is ~6.6ms; 15ms gives
-# clean headroom without compressing the WebSocket curves to the left edge.
-_CDF_XLIM_MS = 8.0
+_CDF_XLIM_MS = 4.0
 
 
 def load_rtts_sampled(rtts_path: Path, max_rows: int = _MAX_RTT_SAMPLES) -> np.ndarray:
@@ -648,18 +672,27 @@ def chart_latency_cdf(out_dir: Path) -> None:
     cdf_records: list[dict] = []
 
     for runtime, variant, label, color, ls, lw, alpha in CDF_RUNS:
-        run_dir = run_map.get((runtime, variant))
-        if run_dir is None:
+        run_dirs = run_map.get((runtime, variant))
+        if not run_dirs:
             print(f"  [warn] chart 3: no run dir for ({runtime}, {variant}) — skipping line")
             continue
-        rtts_path = run_dir / "rtts.csv"
-        if not rtts_path.exists():
-            print(f"  [warn] chart 3: {rtts_path} not found — skipping line")
+
+        # Pool RTT samples from every run of this combination into one CDF.
+        parts: list[np.ndarray] = []
+        for run_dir in run_dirs:
+            rtts_path = run_dir / "rtts.csv"
+            if rtts_path.exists():
+                parts.append(load_rtts_sampled(rtts_path))
+        if not parts:
+            print(f"  [warn] chart 3: no rtts.csv for ({runtime}, {variant}) — skipping line")
             continue
 
-        rtts = load_rtts_sampled(rtts_path)
+        rtts = np.concatenate(parts)
         if len(rtts) == 0:
             continue
+        # Re-cap the pooled set so a multi-run pool stays bounded.
+        if len(rtts) > _MAX_RTT_SAMPLES:
+            rtts = _RNG.choice(rtts, size=_MAX_RTT_SAMPLES, replace=False)
 
         rtts_sorted = np.sort(rtts)
         # CDF x values: all samples ≤ xlim cap
@@ -745,19 +778,31 @@ def chart_cpu_over_time(out_dir: Path) -> None:
     cpu_records: list[dict] = []
 
     for runtime, variant, label, color, ls, lw, alpha in CPU_RUNS:
-        run_dir = run_map.get((runtime, variant))
-        if run_dir is None:
+        run_dirs = run_map.get((runtime, variant))
+        if not run_dirs:
             print(f"  [warn] chart 4: no run dir for ({runtime}, {variant}) — skipping line")
             continue
-        pidstat_path = run_dir / "server_pidstat.log"
-        if not pidstat_path.exists():
-            print(f"  [warn] chart 4: {pidstat_path} not found — skipping line")
+
+        # Average the per-second CPU trace across every run of this combination.
+        # Runs can differ by a sample or two, so pad to the longest with NaN and
+        # take the per-second nanmean.
+        series_list: list[list[float]] = []
+        for run_dir in run_dirs:
+            pidstat_path = run_dir / "server_pidstat.log"
+            if not pidstat_path.exists():
+                continue
+            vals = parse_pidstat(pidstat_path)
+            if vals:
+                series_list.append(vals)
+        if not series_list:
+            print(f"  [warn] chart 4: no CPU data for ({runtime}, {variant}) — skipping line")
             continue
 
-        cpu_vals = parse_pidstat(pidstat_path)
-        if not cpu_vals:
-            print(f"  [warn] chart 4: no CPU data in {pidstat_path} — skipping line")
-            continue
+        maxlen = max(len(s) for s in series_list)
+        arr = np.full((len(series_list), maxlen), np.nan)
+        for i, s in enumerate(series_list):
+            arr[i, : len(s)] = s
+        cpu_vals = np.nanmean(arr, axis=0).tolist()
 
         elapsed = list(range(len(cpu_vals)))
         ax.plot(elapsed, cpu_vals, label=label, color=color, linestyle=ls, linewidth=lw, alpha=alpha)
