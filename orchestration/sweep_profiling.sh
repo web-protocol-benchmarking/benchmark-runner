@@ -28,10 +28,7 @@ RESULTS_BASE="$REPO_ROOT/results"
 PROFILING_DIR="$RESULTS_BASE/profiling"
 
 # --- Profiling parameters -----------------------------------------------------
-# 15s is plenty of wall-clock to collect a representative flamegraph without
-# bloating perf.data. Same concurrency / core pinning as the full sweep so the
-# captured profile reflects the same load shape.
-DURATION=20
+DURATION=30
 CLIENTS=50
 SERVER_CORES="0"
 CLIENT_CORES="1,2"
